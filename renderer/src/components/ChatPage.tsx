@@ -35,17 +35,19 @@ export default function ChatPage() {
   const [apiKey, setApiKey] = useState('');
   const [apiKeySaved, setApiKeySaved] = useState(false);
   const [requestId, setRequestId] = useState<string | null>(null);
+
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
   const settingsRef = useRef<HTMLDivElement>(null);
+  const requestIdRef = useRef<string | null>(null);
 
   // Fetch models
   useEffect(() => {
     if (typeof window === 'undefined' || !window.chutes) return;
-    window.chutes.models().then((res) => {
+    window.chutes.models().then((res: any) => {
       if (res.ok && res.models && res.models.length > 0) {
-        setModels(res.models.filter((m) => m.includes('TEE')));
+        setModels(res.models.filter((m: string) => m.includes('TEE')));
       }
     });
   }, []);
@@ -53,7 +55,7 @@ export default function ChatPage() {
   // Load stored API key
   useEffect(() => {
     if (typeof window === 'undefined' || !window.chutes) return;
-    window.chutes.getApiKey('chutes').then((res) => {
+    window.chutes.getApiKey('chutes').then((res: any) => {
       if (res.ok && res.apiKey) setApiKeySaved(true);
     });
   }, []);
@@ -77,10 +79,8 @@ export default function ChatPage() {
   useEffect(() => {
     if (typeof window === 'undefined' || !window.chutes) return;
 
-    let currentRequestId: string | null = null;
-
-    const disposeChunk = window.chutes.onStreamChunk((payload) => {
-      if (currentRequestId && payload.requestId !== currentRequestId) return;
+    const disposeChunk = window.chutes.onStreamChunk((payload: any) => {
+      if (requestIdRef.current && payload.requestId !== requestIdRef.current) return;
 
       if (payload.done) {
         setMessages((prev) =>
@@ -88,7 +88,7 @@ export default function ChatPage() {
         );
         setIsLoading(false);
         setRequestId(null);
-        currentRequestId = null;
+        requestIdRef.current = null;
         return;
       }
       if (!payload.data) return;
@@ -116,15 +116,15 @@ export default function ChatPage() {
       }
     });
 
-    const disposeError = window.chutes.onStreamError((payload) => {
-      if (currentRequestId && payload.requestId !== currentRequestId) return;
+    const disposeError = window.chutes.onStreamError((payload: any) => {
+      if (requestIdRef.current && payload.requestId !== requestIdRef.current) return;
       setMessages((prev) => [
         ...prev,
         { role: 'assistant', content: `Error: ${payload.error}` },
       ]);
       setIsLoading(false);
       setRequestId(null);
-      currentRequestId = null;
+      requestIdRef.current = null;
     });
 
     return () => {
@@ -147,6 +147,7 @@ export default function ChatPage() {
 
     const id = crypto.randomUUID();
     setRequestId(id);
+    requestIdRef.current = id;
 
     const history = messages
       .filter((m) => !m.isStreaming)
@@ -168,6 +169,7 @@ export default function ChatPage() {
         ]);
         setIsLoading(false);
         setRequestId(null);
+        requestIdRef.current = null;
       }
     } catch (err: any) {
       setMessages((prev) => [
@@ -176,6 +178,7 @@ export default function ChatPage() {
       ]);
       setIsLoading(false);
       setRequestId(null);
+      requestIdRef.current = null;
     }
   }, [input, isLoading, messages, model]);
 
@@ -184,6 +187,7 @@ export default function ChatPage() {
       window.chutes.abort(requestId);
       setIsLoading(false);
       setRequestId(null);
+      requestIdRef.current = null;
       setMessages((prev) =>
         prev.map((m, i) => (i === prev.length - 1 && m.isStreaming ? { ...m, isStreaming: false } : m)),
       );

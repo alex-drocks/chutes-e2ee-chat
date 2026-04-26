@@ -190,8 +190,10 @@ describe('Protocol Invariants (no network)', () => {
     const { ciphertext, tag } = chachaEncrypt(key, nonce, Buffer.from('secret'));
 
     const wrongKey = Buffer.alloc(32, 0x33);
-    const result = chachaDecrypt(wrongKey, nonce, ciphertext, tag);
-    assert.strictEqual(result, null, 'decryption with wrong key must return null (Poly1305 auth failure)');
+    assert.throws(
+      () => chachaDecrypt(wrongKey, nonce, ciphertext, tag),
+      /invalid authentication tag/,
+    );
   });
 
   it('should handle 4KB payloads without leaking', async () => {

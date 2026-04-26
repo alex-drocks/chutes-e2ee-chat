@@ -217,13 +217,13 @@ ipcMain.handle('chutes:models', async () => {
 
 ipcMain.handle('settings:saveApiKey', async (_event, { provider, apiKey }) => {
   try {
-    const creds = await loadCredentials();
-    creds[`${provider}ApiKey`] = apiKey;
-    await saveCredentials(creds);
-
-    if (provider === 'chutes') {
-      resetTransport(apiKey);
+    if (provider !== 'chutes') {
+      return { ok: false, error: 'Unsupported provider. Use "chutes".' };
     }
+    const creds = await loadCredentials();
+    creds.chutesApiKey = apiKey;
+    await saveCredentials(creds);
+    resetTransport(apiKey);
     return { ok: true };
   } catch (err) {
     return { ok: false, error: err.message };
@@ -232,8 +232,11 @@ ipcMain.handle('settings:saveApiKey', async (_event, { provider, apiKey }) => {
 
 ipcMain.handle('settings:getApiKey', async (_event, { provider }) => {
   try {
+    if (provider !== 'chutes') {
+      return { ok: false, error: 'Unsupported provider. Use "chutes".' };
+    }
     const creds = await loadCredentials();
-    return { ok: true, apiKey: creds[`${provider}ApiKey`] || '' };
+    return { ok: true, apiKey: creds.chutesApiKey || '' };
   } catch (err) {
     return { ok: false, error: err.message };
   }

@@ -7,16 +7,10 @@
 
 import { contextBridge, ipcRenderer } from 'electron';
 
-// Robust IPC listener management — returns disposer functions
-const listeners = new Map();
-
 function on(channel, callback) {
   const wrapped = (_event, payload) => callback(payload);
   ipcRenderer.on(channel, wrapped);
-  const disposer = () => ipcRenderer.removeListener(channel, wrapped);
-  const key = `${channel}_${Math.random().toString(36).slice(2)}`;
-  listeners.set(key, disposer);
-  return disposer;
+  return () => ipcRenderer.removeListener(channel, wrapped);
 }
 
 const chutesAPI = {

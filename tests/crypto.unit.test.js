@@ -114,9 +114,10 @@ describe('ChaCha20-Poly1305 encryption', () => {
     const plaintext = Buffer.from('secret message');
 
     const { ciphertext, tag } = chachaEncrypt(key, nonce, plaintext);
-    const result = chachaDecrypt(wrongKey, nonce, ciphertext, tag);
-    // @stablelib returns null on auth failure instead of throwing
-    assert.strictEqual(result, null, 'must return null for bad key');
+    assert.throws(
+      () => chachaDecrypt(wrongKey, nonce, ciphertext, tag),
+      /invalid authentication tag/,
+    );
   });
 
   it('should decrypt to string via Buffer.from()', () => {
