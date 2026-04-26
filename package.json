@@ -11,7 +11,10 @@
     "build:renderer": "cd renderer && next build",
     "build": "npm run build:renderer",
     "start": "electron .",
-    "postinstall": "cd renderer && npm install"
+    "postinstall": "cd renderer && npm install",
+    "test:unit": "node --test tests/crypto.unit.test.js",
+    "test:live": "node --test tests/e2ee-integration.test.js tests/cors-free.test.js",
+    "test": "npm run test:unit && npm run test:live"
   },
   "dependencies": {
     "electron": "^33.0.0",
