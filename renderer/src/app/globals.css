@@ -1,24 +1,27 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+@import 'tailwindcss';
 
-@layer base {
-  :root {
-    --bg-primary: #0f0f0f;
-    --bg-secondary: #1a1a1a;
-    --bg-tertiary: #262626;
-    --text-primary: #e5e5e5;
-    --text-secondary: #a3a3a3;
-    --accent: #22c55e;
-    --accent-hover: #16a34a;
-    --border: #333333;
-    --user-bubble: #166534;
-    --assistant-bubble: #262626;
-  }
+@theme {
+  /* Custom background colors */
+  --color-bg-primary:    #0f0f0f;
+  --color-bg-secondary:  #1a1a1a;
+  --color-bg-tertiary:   #262626;
+  --color-user-bubble:   #166534;
+  --color-assistant-bubble: #262626;
 
-  body {
-    background-color: var(--bg-primary);
-    color: var(--text-primary);
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-  }
+  /* Custom text colors */
+  --color-text-primary:   #e5e5e5;
+  --color-text-secondary: #a3a3a3;
+
+  /* Accent */
+  --color-accent:       #22c55e;
+  --color-accent-hover: #16a34a;
+
+  /* Borders */
+  --color-border: #333333;
+}
+
+body {
+  background-color: var(--color-bg-primary);
+  color: var(--color-text-primary);
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
 }

@@ -19,13 +19,16 @@ const FAST_MODEL = 'Qwen/Qwen3-32B-TEE';
 const REASONING_MODEL = 'moonshotai/Kimi-K2.5-TEE';
 
 describe('Comprehensive E2EE Confidence', { skip: SKIP }, () => {
+  // Re-use a single transport across all tests to reduce API pressure.
+  let transport;
 
-  // ---------------------------------------------------------------------------
-  // Layer 1: Model discovery and resolution
-  // ---------------------------------------------------------------------------
+  it('warmup: initialise shared transport', async () => {
+    transport = new ChutesE2EETransport({ apiKey: API_KEY });
+    const models = await transport.getModels();
+    assert.ok(models.length > 0, 'transport must discover models');
+  });
 
   it('should discover >= 3 TEE models and resolve chute IDs for them', async () => {
-    const transport = new ChutesE2EETransport({ apiKey: API_KEY });
     const models = await transport.getModels();
     const tee = models.filter((m) => m.includes('-TEE'));
     assert.ok(tee.length >= 3, `expected >= 3 TEE models, got ${tee.length}`);
@@ -43,7 +46,7 @@ describe('Comprehensive E2EE Confidence', { skip: SKIP }, () => {
   // ---------------------------------------------------------------------------
 
   it('should return a 1184-byte e2e_pubkey after base64 decode', async () => {
-    const transport = new ChutesE2EETransport({ apiKey: API_KEY });
+
     const chuteId = await transport._discovery.resolveChuteId(FAST_MODEL);
     const inst = await transport._discovery.getNonce(chuteId);
 
@@ -59,7 +62,7 @@ describe('Comprehensive E2EE Confidence', { skip: SKIP }, () => {
   // ---------------------------------------------------------------------------
 
   it('should build a correctly sized encrypted blob with no plaintext leakage', async () => {
-    const transport = new ChutesE2EETransport({ apiKey: API_KEY });
+
     const chuteId = await transport._discovery.resolveChuteId(FAST_MODEL);
     const inst = await transport._discovery.getNonce(chuteId);
 
@@ -101,7 +104,7 @@ describe('Comprehensive E2EE Confidence', { skip: SKIP }, () => {
   // ---------------------------------------------------------------------------
 
   it('should produce different encrypted blobs for identical payloads', async () => {
-    const transport = new ChutesE2EETransport({ apiKey: API_KEY });
+
     const chuteId = await transport._discovery.resolveChuteId(FAST_MODEL);
     const inst = await transport._discovery.getNonce(chuteId);
 
@@ -122,7 +125,7 @@ describe('Comprehensive E2EE Confidence', { skip: SKIP }, () => {
   // ---------------------------------------------------------------------------
 
   it('should complete non-streaming E2EE chat and return coherent English', async () => {
-    const transport = new ChutesE2EETransport({ apiKey: API_KEY });
+
     const { response } = await transport.chat({
       model: FAST_MODEL,
       messages: [{ role: 'user', content: 'What is 2+2? Answer with one word.' }],
@@ -153,7 +156,7 @@ describe('Comprehensive E2EE Confidence', { skip: SKIP }, () => {
   // ---------------------------------------------------------------------------
 
   it('should stream E2EE chat and accumulate human-readable text', async () => {
-    const transport = new ChutesE2EETransport({ apiKey: API_KEY });
+
     const { response } = await transport.chat({
       model: FAST_MODEL,
       messages: [{ role: 'user', content: 'Count to three in English.' }],
@@ -210,7 +213,7 @@ describe('Comprehensive E2EE Confidence', { skip: SKIP }, () => {
   // ---------------------------------------------------------------------------
 
   it('should handle reasoning model (Kimi) returning reasoning_content', async () => {
-    const transport = new ChutesE2EETransport({ apiKey: API_KEY });
+
     const { response } = await transport.chat({
       model: REASONING_MODEL,
       messages: [{ role: 'user', content: 'Explain why 2+2=4 in one short sentence.' }],
@@ -235,7 +238,7 @@ describe('Comprehensive E2EE Confidence', { skip: SKIP }, () => {
   // ---------------------------------------------------------------------------
 
   it('should confirm the raw response is encrypted binary, not plaintext JSON', async () => {
-    const transport = new ChutesE2EETransport({ apiKey: API_KEY });
+
     const chuteId = await transport._discovery.resolveChuteId(FAST_MODEL);
     const inst = await transport._discovery.getNonce(chuteId);
 
@@ -284,7 +287,7 @@ describe('Comprehensive E2EE Confidence', { skip: SKIP }, () => {
   // ---------------------------------------------------------------------------
 
   it('should fail gracefully with an invalid model name', async () => {
-    const transport = new ChutesE2EETransport({ apiKey: API_KEY });
+
     try {
       await transport.chat({
         model: 'totally-fake-model-name/123456789',
@@ -308,7 +311,7 @@ describe('Comprehensive E2EE Confidence', { skip: SKIP }, () => {
   // ---------------------------------------------------------------------------
 
   it('should accept a UUID directly as model name', async () => {
-    const transport = new ChutesE2EETransport({ apiKey: API_KEY });
+
     const chuteId = await transport._discovery.resolveChuteId(FAST_MODEL);
     // Pass the UUID as model — should not attempt resolution
     const resolved = await transport._discovery.resolveChuteId(chuteId);
