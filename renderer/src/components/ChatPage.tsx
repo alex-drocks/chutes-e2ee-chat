@@ -260,6 +260,16 @@ export default function ChatPage() {
         </div>
       </header>
 
+      {/* API Key warning */}
+      {!apiKeySaved && (
+        <div className="px-6 py-2 bg-red-950/60 border-b border-red-900/50 text-xs text-red-300 flex items-center gap-2 justify-center">
+          <span>No API key configured.</span>
+          <button onClick={() => setShowSettings(true)} className="underline hover:text-red-200">
+            Open Settings to add your Chutes API key
+          </button>
+        </div>
+      )}
+
       {/* Settings Modal */}
       {showSettings && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60">
