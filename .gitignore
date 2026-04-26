@@ -1,0 +1,10 @@
+node_modules/
+dist/
+.next/
+out/
+.env
+.env.local
+*.log
+.DS_Store
+package-lock.json
+renderer/package-lock.json
