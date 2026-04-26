@@ -134,7 +134,7 @@ export default function ChatPage() {
   }, []);
 
   const sendMessage = useCallback(async () => {
-    if (!input.trim() || isLoading) return;
+    if (!input.trim() || requestIdRef.current !== null) return;
 
     const userMsg = input.trim();
     setInput('');
