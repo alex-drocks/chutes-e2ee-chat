@@ -1,17 +1,26 @@
 /**
  * Electron Preload Script
  *
- * Exposes a minimal, typed API to the renderer process via contextBridge.
- * No Node.js or Electron APIs leak to the renderer.
+ * Exposes a minimal, typed, security-audited API to the renderer process.
+ * No Node.js or Electron internals leak to the renderer.
  */
 
 import { contextBridge, ipcRenderer } from 'electron';
 
+// Robust IPC listener management — returns disposer functions
+const listeners = new Map();
+
+function on(channel, callback) {
+  const wrapped = (_event, payload) => callback(payload);
+  ipcRenderer.on(channel, wrapped);
+  const disposer = () => ipcRenderer.removeListener(channel, wrapped);
+  const key = `${channel}_${Math.random().toString(36).slice(2)}`;
+  listeners.set(key, disposer);
+  return disposer;
+}
+
 const chutesAPI = {
-  /**
-   * Send a chat completion request. Returns immediately with { ok, stream?, body?, error? }.
-   * For streaming, listen to `chutes:chunk` and `chutes:error` events via onStreamChunk/onStreamError.
-   */
+  /** Send a chat completion request. */
   chat: (requestId, params) => ipcRenderer.invoke('chutes:chat', { requestId, params }),
 
   /** Abort an in-flight streaming request. */
@@ -20,11 +29,18 @@ const chutesAPI = {
   /** Get available models. */
   models: () => ipcRenderer.invoke('chutes:models'),
 
-  /** Register callback for stream chunks. */
-  onStreamChunk: (callback) => ipcRenderer.on('chutes:chunk', (_event, payload) => callback(payload)),
+  /** Register callback for stream chunks. Returns a disposer function. */
+  onStreamChunk: (callback) => on('chutes:chunk', callback),
 
-  /** Register callback for stream errors. */
-  onStreamError: (callback) => ipcRenderer.on('chutes:error', (_event, payload) => callback(payload)),
+  /** Register callback for stream errors. Returns a disposer function. */
+  onStreamError: (callback) => on('chutes:error', callback),
+
+  /** Save API key securely in main process (encrypted at rest). */
+  saveApiKey: (provider, apiKey) =>
+    ipcRenderer.invoke('settings:saveApiKey', { provider, apiKey }),
+
+  /** Get stored API key for a provider. */
+  getApiKey: (provider) => ipcRenderer.invoke('settings:getApiKey', { provider }),
 };
 
 contextBridge.exposeInMainWorld('chutes', chutesAPI);

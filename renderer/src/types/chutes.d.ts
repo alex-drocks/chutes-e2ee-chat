@@ -9,8 +9,10 @@ declare global {
       }) => Promise<{ ok: boolean; stream?: boolean; body?: any; error?: string }>;
       abort: (requestId: string) => void;
       models: () => Promise<{ ok: boolean; models?: string[]; error?: string }>;
-      onStreamChunk: (callback: (payload: { requestId: string; data?: string; done?: boolean }) => void) => void;
-      onStreamError: (callback: (payload: { requestId: string; error: string }) => void) => void;
+      onStreamChunk: (callback: (payload: { requestId: string; data?: string; done?: boolean }) => void) => () => void;
+      onStreamError: (callback: (payload: { requestId: string; error: string }) => void) => () => void;
+      saveApiKey: (provider: string, apiKey: string) => Promise<{ ok: boolean; error?: string }>;
+      getApiKey: (provider: string) => Promise<{ ok: boolean; apiKey?: string; error?: string }>;
     };
   }
 }
