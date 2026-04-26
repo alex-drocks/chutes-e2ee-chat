@@ -17,13 +17,13 @@
     "test": "npm run test:unit && npm run test:live"
   },
   "dependencies": {
-    "electron": "^33.0.0",
-    "mlkem": "^2.3.0",
-    "@stablelib/chacha20poly1305": "^1.0.1",
-    "dotenv": "^16.4.0"
+    "electron": "^41.3.0",
+    "mlkem": "^2.7.0",
+    "@stablelib/chacha20poly1305": "^2.0.1",
+    "dotenv": "^17.4.2"
   },
   "devDependencies": {
-    "concurrently": "^9.0.0",
-    "wait-on": "^8.0.0"
+    "concurrently": "^9.2.1",
+    "wait-on": "^9.0.5"
   }
 }

@@ -293,7 +293,12 @@ describe('Comprehensive E2EE Confidence', { skip: SKIP }, () => {
       });
       assert.fail('expected an error for invalid model');
     } catch (err) {
-      assert.ok(err.message.includes('Could not resolve') || err.message.includes('chute_id'), `unexpected error: ${err.message}`);
+      assert.ok(
+        err.message.includes('Could not resolve') ||
+        err.message.includes('not found') ||
+        err.code === 'MODEL_NOT_FOUND',
+        `unexpected error: ${err.message}`,
+      );
     }
     console.log('  Invalid model correctly rejected');
   });
