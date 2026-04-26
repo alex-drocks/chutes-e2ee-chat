@@ -10,6 +10,7 @@
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import 'dotenv/config';
 
 import { ChutesE2EETransport } from '../lib/chutes/ChutesE2EETransport.js';
 
