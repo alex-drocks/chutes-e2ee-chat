@@ -1,6 +1,15 @@
+/**
+ * Electron Main Process
+ *
+ * - Runs all Chutes API calls in Node.js main to bypass CORS.
+ * - Encrypts credentials with safeStorage.
+ * - Handles streaming via ReadableStream pump.
+ */
+
 import { app, BrowserWindow, ipcMain, safeStorage } from 'electron';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import fs from 'node:fs';
 
 import { ChutesE2EETransport } from './lib/chutes/ChutesE2EETransport.js';
 
@@ -14,7 +23,6 @@ const isDev = !app.isPackaged;
 const CREDENTIALS_FILE = path.join(app.getPath('userData'), 'credentials.enc');
 
 async function loadCredentials() {
-  const fs = await import('node:fs');
   try {
     const encrypted = await fs.promises.readFile(CREDENTIALS_FILE);
     if (safeStorage.isEncryptionAvailable()) {
@@ -27,7 +35,6 @@ async function loadCredentials() {
 }
 
 async function saveCredentials(creds) {
-  const fs = await import('node:fs');
   const data = Buffer.from(JSON.stringify(creds));
   const encrypted = safeStorage.isEncryptionAvailable()
     ? safeStorage.encryptString(JSON.stringify(creds))
@@ -36,17 +43,22 @@ async function saveCredentials(creds) {
 }
 
 // ---------------------------------------------------------------------------
-// Transport initialization
+// Transport lifecycle
 // ---------------------------------------------------------------------------
 
-let chutes = null;
+let transport = null;
 
 async function getTransport() {
-  if (chutes) return chutes;
+  if (transport) return transport;
+
   const creds = await loadCredentials();
   const apiKey = process.env.CHUTES_API_KEY || creds.chutesApiKey || '';
-  chutes = new ChutesE2EETransport({ apiKey });
-  return chutes;
+  transport = new ChutesE2EETransport({ apiKey });
+  return transport;
+}
+
+function resetTransport(apiKey) {
+  transport = new ChutesE2EETransport({ apiKey });
 }
 
 // ---------------------------------------------------------------------------
@@ -88,80 +100,99 @@ app.on('window-all-closed', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Streaming helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Pump an SSE readable stream into renderer IPC events.
+ * Guards against window destruction (race on abort/close).
+ */
+async function pumpSSE(requestId, readableStream, send, done) {
+  const reader = readableStream.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+
+  try {
+    while (true) {
+      const { done: readerDone, value } = await reader.read();
+      if (readerDone) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || '';
+
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (trimmed.startsWith('data: ')) {
+          send({ requestId, data: trimmed.slice(6), done: false });
+        }
+      }
+    }
+
+    // Flush remaining buffer
+    if (buffer.trim().startsWith('data: ')) {
+      send({ requestId, data: buffer.trim().slice(6), done: false });
+    }
+  } catch (err) {
+    if (err.name !== 'AbortError') {
+      send({ requestId, error: err.message, done: true });
+    }
+  } finally {
+    reader.releaseLock();
+    done(requestId);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // IPC handlers
 // ---------------------------------------------------------------------------
 
-const activeControllers = new Map();
-const streamingWindows = new Map(); // requestId -> BrowserWindow
+const activeControllers = new Map(); // requestId -> abort()
+const streamingWindows = new Map();  // requestId -> BrowserWindow
+
+/** Send a chunk/error to the renderer for a given request. */
+function sendToRenderer(requestId, payload) {
+  const win = streamingWindows.get(requestId);
+  if (!win || win.isDestroyed()) return false;
+
+  if (payload.error) {
+    win.webContents.send('chutes:error', payload);
+  } else {
+    win.webContents.send('chutes:chunk', payload);
+  }
+  return true;
+}
+
+/** Cleanup a request's state. */
+function cleanupRequest(requestId) {
+  activeControllers.delete(requestId);
+  streamingWindows.delete(requestId);
+}
 
 ipcMain.handle('chutes:chat', async (event, { requestId, params }) => {
   const win = BrowserWindow.fromWebContents(event.sender);
   streamingWindows.set(requestId, win);
 
   try {
-    const transport = await getTransport();
-    const { response, abort } = await transport.chat(params);
+    const t = await getTransport();
+    const { response, abort } = await t.chat(params);
     activeControllers.set(requestId, abort);
 
     if (params.stream) {
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = '';
-
-      const pump = async () => {
-        try {
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-
-            buffer += decoder.decode(value, { stream: true });
-            const lines = buffer.split('\n');
-            buffer = lines.pop() || '';
-
-            for (const line of lines) {
-              if (line.trim().startsWith('data: ')) {
-                const data = line.trim().slice(6);
-                const target = streamingWindows.get(requestId);
-                if (target && !target.isDestroyed()) {
-                  target.webContents.send('chutes:chunk', { requestId, data, done: data === '[DONE]' });
-                }
-              }
-            }
-          }
-
-          if (buffer.trim() && buffer.trim().startsWith('data: ')) {
-            const target = streamingWindows.get(requestId);
-            if (target && !target.isDestroyed()) {
-              target.webContents.send('chutes:chunk', { requestId, data: buffer.trim().slice(6) });
-            }
-          }
-
-          const target = streamingWindows.get(requestId);
-          if (target && !target.isDestroyed()) {
-            target.webContents.send('chutes:chunk', { requestId, done: true });
-          }
-        } catch (err) {
-          const target = streamingWindows.get(requestId);
-          if (target && !target.isDestroyed()) {
-            target.webContents.send('chutes:error', { requestId, error: err.message });
-          }
-        } finally {
-          activeControllers.delete(requestId);
-          streamingWindows.delete(requestId);
-        }
+      const send = (p) => sendToRenderer(requestId, p);
+      const done = () => {
+        sendToRenderer(requestId, { requestId, done: true });
+        cleanupRequest(requestId);
       };
-
-      pump();
+      pumpSSE(requestId, response.body, send, () => cleanupRequest(requestId));
       return { ok: true, stream: true };
     }
 
     const body = await response.json();
-    activeControllers.delete(requestId);
-    streamingWindows.delete(requestId);
+    cleanupRequest(requestId);
     return { ok: true, stream: false, body };
   } catch (err) {
-    activeControllers.delete(requestId);
-    streamingWindows.delete(requestId);
+    cleanupRequest(requestId);
     return { ok: false, error: err.message };
   }
 });
@@ -170,15 +201,14 @@ ipcMain.handle('chutes:abort', (_event, { requestId }) => {
   const abort = activeControllers.get(requestId);
   if (abort) {
     abort();
-    activeControllers.delete(requestId);
-    streamingWindows.delete(requestId);
+    cleanupRequest(requestId);
   }
 });
 
 ipcMain.handle('chutes:models', async () => {
   try {
-    const transport = await getTransport();
-    const models = await transport.getModels();
+    const t = await getTransport();
+    const models = await t.getModels();
     return { ok: true, models };
   } catch (err) {
     return { ok: false, error: err.message };
@@ -190,9 +220,9 @@ ipcMain.handle('settings:saveApiKey', async (_event, { provider, apiKey }) => {
     const creds = await loadCredentials();
     creds[`${provider}ApiKey`] = apiKey;
     await saveCredentials(creds);
-    // Re-initialize transport with new key
+
     if (provider === 'chutes') {
-      chutes = new ChutesE2EETransport({ apiKey });
+      resetTransport(apiKey);
     }
     return { ok: true };
   } catch (err) {

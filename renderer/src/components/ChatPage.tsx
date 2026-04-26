@@ -15,8 +15,8 @@ const FALLBACK_MODELS = [
   'Qwen/Qwen3-32B-TEE',
   'moonshotai/Kimi-K2.6-TEE',
   'moonshotai/Kimi-K2.5-TEE',
-  'deepseek-ai/DeepSeek-V3',
-  'deepseek-ai/DeepSeek-R1',
+  'deepseek-ai/DeepSeek-V3-TEE',
+  'deepseek-ai/DeepSeek-R1-TEE',
 ];
 
 export default function ChatPage() {
