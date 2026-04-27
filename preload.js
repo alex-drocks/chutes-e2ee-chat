@@ -29,6 +29,9 @@ const chutesAPI = {
   /** Run a lightweight web search from the main process. */
   webSearch: (query) => ipcRenderer.invoke('chutes:webSearch', { query }),
 
+  /** Read a screenshot/image from the native clipboard when paste events do not expose files. */
+  clipboardImage: () => ipcRenderer.invoke('chutes:clipboardImage'),
+
   /** Register callback for stream chunks. Returns a disposer function. */
   onStreamChunk: (callback) => on('chutes:chunk', callback),
 

@@ -19,6 +19,7 @@ declare global {
       models: () => Promise<{ ok: boolean; models?: string[]; metadata?: ChutesModelMetadata[]; error?: string }>;
       modelStats: () => Promise<{ ok: boolean; stats?: Record<string, ChutesModelStats>; error?: string }>;
       webSearch: (query: string) => Promise<{ ok: boolean; results?: ChutesWebSearchResult[]; fetchedAt?: string; provider?: string; error?: string }>;
+      clipboardImage: () => Promise<{ ok: boolean; hasImage?: boolean; dataUrl?: string; mimeType?: string; size?: number; error?: string }>;
       onStreamChunk: (callback: (payload: { requestId: string; data?: string; done?: boolean }) => void) => () => void;
       onStreamError: (callback: (payload: { requestId: string; error: string }) => void) => () => void;
       saveApiKey: (provider: string, apiKey: string) => Promise<ApiKeyStatusResponse>;

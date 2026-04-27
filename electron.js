@@ -16,7 +16,7 @@ import { ChutesE2EETransport } from './lib/chutes/ChutesE2EETransport.js';
 import { DEFAULT_API_BASE, DEFAULT_MODELS_BASE } from './lib/chutes/constants.js';
 
 const require = createRequire(import.meta.url);
-const { app, BrowserWindow, ipcMain, net, protocol, safeStorage } = require('electron');
+const { app, BrowserWindow, clipboard, ipcMain, net, protocol, safeStorage } = require('electron');
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rendererUrl = process.env.ELECTRON_RENDERER_URL;
 const rendererDistDir = path.join(__dirname, 'renderer', 'dist');
@@ -724,6 +724,27 @@ ipcMain.handle('chutes:modelStats', async (event) => {
     assertTrustedSender(event);
     const stats = await fetchModelStats();
     return { ok: true, stats };
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+});
+
+ipcMain.handle('chutes:clipboardImage', async (event) => {
+  try {
+    assertTrustedSender(event);
+    const image = clipboard.readImage();
+    if (image.isEmpty()) {
+      return { ok: true, hasImage: false };
+    }
+
+    const png = image.toPNG();
+    return {
+      ok: true,
+      hasImage: true,
+      dataUrl: image.toDataURL(),
+      mimeType: 'image/png',
+      size: png.byteLength,
+    };
   } catch (err) {
     return { ok: false, error: err.message };
   }

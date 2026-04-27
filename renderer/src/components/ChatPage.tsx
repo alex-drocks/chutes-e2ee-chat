@@ -17,6 +17,7 @@ import {
   Loader2,
   Lock,
   Paperclip,
+  Plus,
   RotateCcw,
   Search,
   Send,
@@ -235,6 +236,8 @@ export default function ChatPage() {
     status: aiStatus,
     error: aiError,
     addToolOutput,
+    setMessages: setAiMessages,
+    clearError: clearAiError,
   } = chat;
 
   useEffect(() => {
@@ -600,14 +603,17 @@ export default function ChatPage() {
     setAttachments((prev) => prev.filter((attachment) => attachment.id !== id));
   }, []);
 
-  const handleFiles = useCallback(async (files: FileList | null) => {
-    if (!files || files.length === 0) return;
+  const addFiles = useCallback(async (files: File[]) => {
+    if (files.length === 0) return;
 
     const nextAttachments = await Promise.all(
-      Array.from(files).map(async (file): Promise<MessageAttachment> => {
+      files.map(async (file, index): Promise<MessageAttachment> => {
+        const fallbackName = file.type.startsWith('image/')
+          ? `pasted-screenshot-${Date.now()}-${index + 1}.${extensionForMimeType(file.type)}`
+          : `pasted-file-${Date.now()}-${index + 1}`;
         const base = {
           id: crypto.randomUUID(),
-          name: file.name,
+          name: file.name || fallbackName,
           mimeType: file.type || 'application/octet-stream',
           size: file.size,
         };
@@ -637,6 +643,73 @@ export default function ChatPage() {
     if (fileInputRef.current) fileInputRef.current.value = '';
   }, []);
 
+  const handleFiles = useCallback((files: FileList | null) => {
+    if (!files || files.length === 0) return;
+    addFiles(Array.from(files));
+  }, [addFiles]);
+
+  const addNativeClipboardImage = useCallback(async () => {
+    const result = await window.chutes.clipboardImage();
+    if (!result.ok || !result.hasImage || !result.dataUrl) return false;
+
+    setAttachments((prev) => [
+      ...prev,
+      {
+        id: crypto.randomUUID(),
+        name: `pasted-screenshot-${Date.now()}.png`,
+        mimeType: result.mimeType || 'image/png',
+        size: result.size || 0,
+        kind: 'image',
+        dataUrl: result.dataUrl,
+      },
+    ]);
+    return true;
+  }, []);
+
+  useEffect(() => {
+    const handleDocumentPaste = (event: ClipboardEvent) => {
+      const target = event.target as HTMLElement | null;
+      if (target?.closest('input, textarea, [contenteditable="true"]')) return;
+
+      const files = clipboardFilesFromData(event.clipboardData);
+      if (files.length > 0) {
+        event.preventDefault();
+        event.stopPropagation();
+        addFiles(files);
+        inputRef.current?.focus();
+        return;
+      }
+
+      if (event.clipboardData?.getData('text/plain')) return;
+
+      event.preventDefault();
+      event.stopPropagation();
+      addNativeClipboardImage().then((added) => {
+        if (added) inputRef.current?.focus();
+      });
+    };
+
+    document.addEventListener('paste', handleDocumentPaste);
+    return () => document.removeEventListener('paste', handleDocumentPaste);
+  }, [addFiles, addNativeClipboardImage]);
+
+  const handleComposerPaste = useCallback((event: React.ClipboardEvent) => {
+    const clipboardFiles = clipboardFilesFromData(event.clipboardData);
+    if (clipboardFiles.length > 0) {
+      event.preventDefault();
+      event.stopPropagation();
+      addFiles(clipboardFiles);
+      return;
+    }
+
+    const text = event.clipboardData.getData('text/plain');
+    if (text) return;
+
+    event.preventDefault();
+    event.stopPropagation();
+    addNativeClipboardImage();
+  }, [addFiles, addNativeClipboardImage]);
+
   const abort = useCallback(() => {
     stopAiMessage();
     setIsLoading(false);
@@ -662,6 +735,21 @@ export default function ChatPage() {
     },
     [getCurrentChatConfig, regenerateAiMessage],
   );
+
+  const startNewConversation = useCallback(() => {
+    if (isLoading) {
+      stopAiMessage();
+    }
+    clearAiError();
+    setAiMessages([]);
+    setInput('');
+    setAttachments([]);
+    setNudges([]);
+    setCurrentStatus(undefined);
+    setStreamStage('idle');
+    retryCountRef.current = 0;
+    window.setTimeout(() => inputRef.current?.focus(), 0);
+  }, [clearAiError, isLoading, setAiMessages, stopAiMessage]);
 
   const saveKey = async () => {
     if (!apiKey.trim()) return;
@@ -730,6 +818,15 @@ export default function ChatPage() {
         <div className="flex items-center gap-2">
           <Shield className="h-5 w-5 text-[var(--accent)]" />
           <h1 className="text-lg font-semibold text-[var(--text-primary)]">Chutes E2EE Chat</h1>
+          <button
+            type="button"
+            onClick={startNewConversation}
+            className="ml-3 inline-flex items-center gap-1.5 rounded-lg border border-[var(--border)] bg-[var(--bg-tertiary)] px-2.5 py-1.5 text-xs text-[var(--text-secondary)] transition-colors hover:border-[var(--accent)]/60 hover:text-[var(--text-primary)]"
+            title="Start a new conversation"
+          >
+            <Plus className="h-3.5 w-3.5" />
+            New chat
+          </button>
         </div>
 
         <div className="flex min-w-0 flex-wrap items-center justify-end gap-2">
@@ -893,7 +990,7 @@ export default function ChatPage() {
       )}
 
       <Conversation>
-        <ConversationContent autoScroll className="flex flex-col gap-2">
+        <ConversationContent autoScroll className="flex flex-col gap-1 px-6 py-6">
           {aiMessages.length === 0 && <AssistantWelcome />}
 
           {aiMessages.map((message, index) => (
@@ -908,7 +1005,7 @@ export default function ChatPage() {
           ))}
 
           {aiError && aiStatus === 'error' && (
-            <div className="mx-auto w-full max-w-[900px] rounded-xl border border-red-900/60 bg-red-950/30 px-4 py-3 text-sm text-red-200">
+            <div className="mx-auto w-full max-w-[980px] rounded-xl border border-red-900/60 bg-red-950/30 px-4 py-3 text-sm text-red-200">
               <div className="mb-2 flex items-center gap-2">
                 <WifiOff className="h-4 w-4" />
                 <span>{aiError.message}</span>
@@ -921,12 +1018,12 @@ export default function ChatPage() {
           )}
 
           {currentStatus && isLoading && (
-            <div className="mx-auto w-full max-w-[900px]">
+            <div className="mx-auto w-full max-w-[980px]">
               <LiveStatusCard status={currentStatus} />
             </div>
           )}
 
-          <div className="mx-auto w-full max-w-[900px]">{stageIndicator()}</div>
+          <div className="mx-auto w-full max-w-[980px]">{stageIndicator()}</div>
         </ConversationContent>
         <ConversationScrollButton />
 
@@ -948,6 +1045,7 @@ export default function ChatPage() {
             onInputChange={setInput}
             onSubmit={sendMessage}
             onKeyDown={handleTextAreaKeyDown}
+            onPaste={handleComposerPaste}
             onFiles={handleFiles}
             onRemoveAttachment={removeAttachment}
             onToggleWebSearch={() => setWebSearchEnabled((enabled) => !enabled)}
@@ -961,7 +1059,7 @@ export default function ChatPage() {
 
 function AssistantWelcome() {
   return (
-    <div className="mx-auto flex w-full max-w-[900px] gap-3 py-3">
+    <div className="mx-auto flex w-full max-w-[980px] gap-3 py-2.5">
       <MessageAvatar from="assistant" icon={<Bot className="h-4 w-4" />} />
       <div className="max-w-2xl rounded-2xl rounded-bl-md border border-[var(--border)] bg-[var(--bg-secondary)]/90 px-4 py-3 text-sm leading-relaxed text-[var(--text-primary)] shadow-lg shadow-black/10">
         <p>{WELCOME_MESSAGE.content.split('\n\n')[0]}</p>
@@ -1005,7 +1103,7 @@ function UserMessage({ message }: { message: ChutesUIMessage }) {
   const text = collectText(message.parts);
 
   return (
-    <AIMessage from="user" className="mx-auto max-w-[900px]">
+    <AIMessage from="user" className="mx-auto max-w-[980px]">
       <MessageContent from="user">
         {attachments.length > 0 && (
           <div className="mb-2 flex flex-wrap gap-1.5">
@@ -1054,10 +1152,10 @@ function AssistantMessage({
   };
 
   return (
-    <AIMessage from="assistant" className="mx-auto max-w-[900px]">
+    <AIMessage from="assistant" className="mx-auto max-w-[980px]">
       <MessageAvatar from="assistant" icon={<Bot className="h-4 w-4" />} />
 
-      <div className="min-w-[120px] max-w-[min(82%,52rem)] flex-1">
+      <div className="min-w-[120px] max-w-[min(86%,56rem)] flex-1">
         {metadata?.memoryContext && metadata.memoryContext.length > 0 && (
           <MemoryRecallFencing
             memories={metadata.memoryContext.map((mc) => ({ label: mc.label, content: mc.content }))}
@@ -1140,6 +1238,7 @@ function ChatComposer({
   onInputChange,
   onSubmit,
   onKeyDown,
+  onPaste,
   onFiles,
   onRemoveAttachment,
   onToggleWebSearch,
@@ -1155,6 +1254,7 @@ function ChatComposer({
   onInputChange: (value: string) => void;
   onSubmit: () => void;
   onKeyDown: (event: React.KeyboardEvent) => void;
+  onPaste: (event: React.ClipboardEvent) => void;
   onFiles: (files: FileList | null) => void;
   onRemoveAttachment: (id: string) => void;
   onToggleWebSearch: () => void;
@@ -1163,12 +1263,13 @@ function ChatComposer({
   const hasImageAttachment = attachments.some((attachment) => attachment.kind === 'image');
 
   return (
-    <div className="mx-auto max-w-[900px]">
+    <div className="mx-auto max-w-[980px]">
       <PromptInput
         onSubmit={(event) => {
           event.preventDefault();
           onSubmit();
         }}
+        onPaste={onPaste}
       >
         {attachments.length > 0 && (
           <div className="mb-2 flex flex-wrap gap-2 border-b border-[var(--border)]/70 pb-2">
@@ -1211,6 +1312,7 @@ function ChatComposer({
             value={input}
             onChange={(event) => onInputChange(event.currentTarget.value)}
             onKeyDown={onKeyDown}
+            onPaste={onPaste}
             placeholder={isLoading ? 'Interrupt to send a new message...' : 'Type an encrypted message...'}
             disabled={isLoading}
           />
@@ -1601,6 +1703,25 @@ function readFileAsText(file: File) {
     reader.onerror = () => reject(reader.error || new Error('Could not read file.'));
     reader.readAsText(file);
   });
+}
+
+function clipboardFilesFromData(data: DataTransfer | null): File[] {
+  if (!data) return [];
+  const itemFiles = Array.from(data.items || [])
+    .filter((item) => item.kind === 'file')
+    .map((item) => item.getAsFile())
+    .filter((file): file is File => Boolean(file));
+
+  const files = itemFiles.length > 0 ? itemFiles : Array.from(data.files || []);
+  return files.filter((file) => file.size > 0);
+}
+
+function extensionForMimeType(mimeType: string) {
+  if (mimeType.includes('jpeg') || mimeType.includes('jpg')) return 'jpg';
+  if (mimeType.includes('webp')) return 'webp';
+  if (mimeType.includes('gif')) return 'gif';
+  if (mimeType.includes('bmp')) return 'bmp';
+  return 'png';
 }
 
 function isTextFile(file: File) {

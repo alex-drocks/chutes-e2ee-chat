@@ -10,7 +10,7 @@ export const PromptInput = forwardRef<HTMLFormElement, FormHTMLAttributes<HTMLFo
     <form
       ref={ref}
       className={cn(
-        'rounded-2xl border border-[var(--border)] bg-[var(--bg-tertiary)]/80 p-2 shadow-2xl shadow-black/20 focus-within:border-[var(--accent)]/70',
+        'rounded-2xl border border-[var(--border)] bg-[var(--bg-tertiary)]/95 p-2 shadow-2xl shadow-black/25 focus-within:border-[var(--accent)]/70',
         className,
       )}
       {...props}
@@ -25,7 +25,7 @@ export const PromptInputTextarea = forwardRef<HTMLTextAreaElement, TextareaHTMLA
       ref={ref}
       rows={1}
       className={cn(
-        'max-h-32 min-h-11 flex-1 resize-none bg-transparent px-3 py-3 text-sm text-[var(--text-primary)] placeholder-[var(--text-secondary)] outline-none disabled:opacity-60',
+        'max-h-32 min-h-10 flex-1 resize-none bg-transparent px-3 py-2.5 text-sm leading-5 text-[var(--text-primary)] placeholder-[var(--text-secondary)] outline-none disabled:opacity-60',
         className,
       )}
       {...props}
@@ -35,7 +35,7 @@ export const PromptInputTextarea = forwardRef<HTMLTextAreaElement, TextareaHTMLA
 PromptInputTextarea.displayName = 'PromptInputTextarea';
 
 export function PromptInputBody({ className, ...props }: HTMLAttributes<HTMLDivElement>) {
-  return <div className={cn('flex items-end gap-1', className)} {...props} />;
+  return <div className={cn('flex items-center gap-2', className)} {...props} />;
 }
 
 export function PromptInputFooter({ className, ...props }: HTMLAttributes<HTMLDivElement>) {
@@ -55,9 +55,10 @@ export const PromptInputButton = forwardRef<HTMLButtonElement, PromptInputButton
     <button
       ref={ref}
       type="button"
+      data-prompt-input-button="true"
+      data-active={active ? 'true' : 'false'}
       className={cn(
-        'shrink-0 rounded-xl p-3 text-[var(--text-secondary)] transition-colors hover:bg-white/5 hover:text-[var(--text-primary)] disabled:opacity-40',
-        active && 'bg-[var(--accent)] text-black hover:bg-[var(--accent-hover)] hover:text-black',
+        'flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border border-transparent p-0 text-[var(--text-secondary)] transition-colors hover:bg-white/5 hover:text-[var(--text-primary)] disabled:opacity-40',
         className,
       )}
       {...props}
@@ -76,7 +77,7 @@ export const PromptInputSubmit = forwardRef<HTMLButtonElement, PromptInputSubmit
       ref={ref}
       type="submit"
       className={cn(
-        'shrink-0 rounded-xl bg-[var(--accent)] p-3 text-black transition-colors hover:bg-[var(--accent-hover)] disabled:opacity-40',
+        'flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-[var(--accent)] p-0 text-black transition-colors hover:bg-[var(--accent-hover)] disabled:opacity-40',
         status !== 'ready' && 'bg-red-600 text-white hover:bg-red-700',
         className,
       )}
