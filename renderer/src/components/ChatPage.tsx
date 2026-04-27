@@ -99,6 +99,11 @@ type ApiKeyStatus = {
   isOsBackedStorage?: boolean;
 };
 
+type ClipboardStatus = {
+  level: 'info' | 'error';
+  message: string;
+};
+
 const EMPTY_API_KEY_STATUS: ApiKeyStatus = {
   hasApiKey: false,
   hasStoredKey: false,
@@ -133,6 +138,7 @@ export default function ChatPage() {
   const [apiKeySaved, setApiKeySaved] = useState(false);
   const [apiKeyStatus, setApiKeyStatus] = useState<ApiKeyStatus>(EMPTY_API_KEY_STATUS);
   const [apiKeyError, setApiKeyError] = useState('');
+  const [clipboardStatus, setClipboardStatus] = useState<ClipboardStatus | null>(null);
   const [currentStatus, setCurrentStatus] = useState<MessageStatus | undefined>();
   const [nudges, setNudges] = useState<NudgeAction[]>([]);
   const [showMemoryPanel, setShowMemoryPanel] = useState(false);
@@ -143,6 +149,8 @@ export default function ChatPage() {
   const menuRef = useRef<HTMLDivElement>(null);
   const settingsRef = useRef<HTMLDivElement>(null);
   const retryCountRef = useRef(0);
+  const clipboardImagePasteInFlightRef = useRef(false);
+  const pasteEventHandledRef = useRef(false);
   const memoryStoreRef = useRef<MemoryStore>(new MemoryStore());
   const addToolOutputRef = useRef<any>(null);
   const chatConfigRef = useRef<ChutesChatConfig>({
@@ -640,6 +648,7 @@ export default function ChatPage() {
     );
 
     setAttachments((prev) => [...prev, ...nextAttachments]);
+    setClipboardStatus(null);
     if (fileInputRef.current) fileInputRef.current.value = '';
   }, []);
 
@@ -650,7 +659,15 @@ export default function ChatPage() {
 
   const addNativeClipboardImage = useCallback(async () => {
     const result = await window.chutes.clipboardImage();
-    if (!result.ok || !result.hasImage || !result.dataUrl) return false;
+    if (!result.ok) {
+      setClipboardStatus({ level: 'error', message: result.error || 'Could not read clipboard.' });
+      return false;
+    }
+
+    if (!result.hasImage || !result.dataUrl) {
+      setClipboardStatus({ level: 'error', message: 'No screenshot image found in the clipboard.' });
+      return false;
+    }
 
     setAttachments((prev) => [
       ...prev,
@@ -663,11 +680,34 @@ export default function ChatPage() {
         dataUrl: result.dataUrl,
       },
     ]);
+    setClipboardStatus(null);
     return true;
   }, []);
 
+  const addClipboardImages = useCallback(async () => {
+    if (clipboardImagePasteInFlightRef.current) return false;
+    clipboardImagePasteInFlightRef.current = true;
+    setClipboardStatus({ level: 'info', message: 'Checking clipboard for a screenshot...' });
+
+    try {
+      const asyncClipboardFiles = await readClipboardImageFiles();
+      if (asyncClipboardFiles.length > 0) {
+        await addFiles(asyncClipboardFiles);
+        setClipboardStatus(null);
+        return true;
+      }
+
+      return await addNativeClipboardImage();
+    } finally {
+      window.setTimeout(() => {
+        clipboardImagePasteInFlightRef.current = false;
+      }, 250);
+    }
+  }, [addFiles, addNativeClipboardImage]);
+
   useEffect(() => {
     const handleDocumentPaste = (event: ClipboardEvent) => {
+      pasteEventHandledRef.current = true;
       const target = event.target as HTMLElement | null;
       if (target?.closest('input, textarea, [contenteditable="true"]')) return;
 
@@ -680,20 +720,41 @@ export default function ChatPage() {
         return;
       }
 
-      if (event.clipboardData?.getData('text/plain')) return;
+      if (event.clipboardData?.getData('text/plain') && !clipboardLooksLikeImage(event.clipboardData)) {
+        return;
+      }
 
       event.preventDefault();
       event.stopPropagation();
-      addNativeClipboardImage().then((added) => {
+      addClipboardImages().then((added) => {
         if (added) inputRef.current?.focus();
       });
     };
 
     document.addEventListener('paste', handleDocumentPaste);
     return () => document.removeEventListener('paste', handleDocumentPaste);
-  }, [addFiles, addNativeClipboardImage]);
+  }, [addClipboardImages, addFiles]);
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      const isPasteShortcut = (event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'v';
+      if (!isPasteShortcut) return;
+
+      pasteEventHandledRef.current = false;
+      window.setTimeout(() => {
+        if (pasteEventHandledRef.current) return;
+        addClipboardImages().then((added) => {
+          if (added) inputRef.current?.focus();
+        });
+      }, 60);
+    };
+
+    document.addEventListener('keydown', handleKeyDown);
+    return () => document.removeEventListener('keydown', handleKeyDown);
+  }, [addClipboardImages]);
 
   const handleComposerPaste = useCallback((event: React.ClipboardEvent) => {
+    pasteEventHandledRef.current = true;
     const clipboardFiles = clipboardFilesFromData(event.clipboardData);
     if (clipboardFiles.length > 0) {
       event.preventDefault();
@@ -703,12 +764,12 @@ export default function ChatPage() {
     }
 
     const text = event.clipboardData.getData('text/plain');
-    if (text) return;
+    if (text && !clipboardLooksLikeImage(event.clipboardData)) return;
 
     event.preventDefault();
     event.stopPropagation();
-    addNativeClipboardImage();
-  }, [addFiles, addNativeClipboardImage]);
+    addClipboardImages();
+  }, [addClipboardImages, addFiles]);
 
   const abort = useCallback(() => {
     stopAiMessage();
@@ -745,6 +806,7 @@ export default function ChatPage() {
     setInput('');
     setAttachments([]);
     setNudges([]);
+    setClipboardStatus(null);
     setCurrentStatus(undefined);
     setStreamStage('idle');
     retryCountRef.current = 0;
@@ -1037,6 +1099,7 @@ export default function ChatPage() {
           <ChatComposer
             input={input}
             attachments={attachments}
+            clipboardStatus={clipboardStatus}
             isLoading={isLoading}
             webSearchEnabled={webSearchEnabled}
             selectedModelAcceptsImages={selectedModelAcceptsImages}
@@ -1230,6 +1293,7 @@ function AssistantMessage({
 function ChatComposer({
   input,
   attachments,
+  clipboardStatus,
   isLoading,
   webSearchEnabled,
   selectedModelAcceptsImages,
@@ -1246,6 +1310,7 @@ function ChatComposer({
 }: {
   input: string;
   attachments: MessageAttachment[];
+  clipboardStatus: ClipboardStatus | null;
   isLoading: boolean;
   webSearchEnabled: boolean;
   selectedModelAcceptsImages: boolean;
@@ -1285,6 +1350,20 @@ function ChatComposer({
                 Selected model does not advertise image input.
               </span>
             )}
+          </div>
+        )}
+
+        {clipboardStatus && (
+          <div
+            className={cn(
+              'mb-2 rounded-lg border px-3 py-2 text-xs',
+              clipboardStatus.level === 'info' && 'border-[var(--border)] bg-black/15 text-[var(--text-secondary)]',
+              clipboardStatus.level === 'error' && 'border-amber-900/60 bg-amber-950/25 text-amber-200',
+            )}
+          >
+            <div className="flex items-center justify-between gap-3">
+              <span>{clipboardStatus.message}</span>
+            </div>
           </div>
         )}
 
@@ -1714,6 +1793,39 @@ function clipboardFilesFromData(data: DataTransfer | null): File[] {
 
   const files = itemFiles.length > 0 ? itemFiles : Array.from(data.files || []);
   return files.filter((file) => file.size > 0);
+}
+
+function clipboardLooksLikeImage(data: DataTransfer | null) {
+  if (!data) return false;
+  const types = Array.from(data.types || []).map((type) => type.toLowerCase());
+  if (types.some((type) => type.includes('image') || type === 'files')) return true;
+  return Array.from(data.items || []).some((item) => item.type.toLowerCase().startsWith('image/'));
+}
+
+async function readClipboardImageFiles() {
+  if (typeof navigator === 'undefined' || !navigator.clipboard || typeof navigator.clipboard.read !== 'function') {
+    return [];
+  }
+
+  try {
+    const items = await navigator.clipboard.read();
+    const files: File[] = [];
+    for (const item of items) {
+      const imageType = item.types.find((type) => type.startsWith('image/'));
+      if (!imageType) continue;
+      const blob = await item.getType(imageType);
+      files.push(
+        new File(
+          [blob],
+          `pasted-screenshot-${Date.now()}-${files.length + 1}.${extensionForMimeType(imageType)}`,
+          { type: imageType },
+        ),
+      );
+    }
+    return files;
+  } catch {
+    return [];
+  }
 }
 
 function extensionForMimeType(mimeType: string) {

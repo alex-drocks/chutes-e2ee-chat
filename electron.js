@@ -11,6 +11,8 @@ import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import fs from 'node:fs';
 import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
+import { execFile as execFileCallback } from 'node:child_process';
+import { promisify } from 'node:util';
 
 import { ChutesE2EETransport } from './lib/chutes/ChutesE2EETransport.js';
 import { DEFAULT_API_BASE, DEFAULT_MODELS_BASE } from './lib/chutes/constants.js';
@@ -18,6 +20,7 @@ import { DEFAULT_API_BASE, DEFAULT_MODELS_BASE } from './lib/chutes/constants.js
 const require = createRequire(import.meta.url);
 const { app, BrowserWindow, clipboard, ipcMain, net, protocol, safeStorage } = require('electron');
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const execFile = promisify(execFileCallback);
 const rendererUrl = process.env.ELECTRON_RENDERER_URL;
 const rendererDistDir = path.join(__dirname, 'renderer', 'dist');
 const API_KEY_PROVIDER = 'chutes';
@@ -320,6 +323,10 @@ function createWindow() {
       sandbox: true,
     },
     titleBarStyle: 'hiddenInset',
+  });
+
+  win.once('ready-to-show', () => {
+    win.maximize();
   });
 
   if (rendererUrl) {
@@ -643,6 +650,45 @@ function cleanupRequest(requestId) {
   streamingWindows.delete(requestId);
 }
 
+async function readWindowsClipboardImageFromWSL() {
+  if (!process.env.WSL_DISTRO_NAME && !process.env.WSL_INTEROP) return null;
+
+  const script = `
+    Add-Type -AssemblyName System.Windows.Forms
+    Add-Type -AssemblyName System.Drawing
+    $image = [System.Windows.Forms.Clipboard]::GetImage()
+    if ($null -eq $image) { exit 2 }
+    $stream = New-Object System.IO.MemoryStream
+    try {
+      $image.Save($stream, [System.Drawing.Imaging.ImageFormat]::Png)
+      [Convert]::ToBase64String($stream.ToArray())
+    } finally {
+      $stream.Dispose()
+      $image.Dispose()
+    }
+  `;
+
+  try {
+    const { stdout } = await execFile(
+      'powershell.exe',
+      ['-NoProfile', '-NonInteractive', '-STA', '-Command', script],
+      { timeout: 4000, maxBuffer: 64 * 1024 * 1024, windowsHide: true },
+    );
+    const base64 = String(stdout || '').replace(/\s/g, '');
+    if (!base64) return null;
+    const buffer = Buffer.from(base64, 'base64');
+    if (buffer.length === 0) return null;
+    return {
+      dataUrl: `data:image/png;base64,${base64}`,
+      mimeType: 'image/png',
+      size: buffer.byteLength,
+      source: 'windows-clipboard',
+    };
+  } catch {
+    return null;
+  }
+}
+
 ipcMain.handle('chutes:chat', async (event, { requestId, params }) => {
   try {
     assertTrustedSender(event);
@@ -733,17 +779,27 @@ ipcMain.handle('chutes:clipboardImage', async (event) => {
   try {
     assertTrustedSender(event);
     const image = clipboard.readImage();
-    if (image.isEmpty()) {
+    if (!image.isEmpty()) {
+      const png = image.toPNG();
+      return {
+        ok: true,
+        hasImage: true,
+        dataUrl: image.toDataURL(),
+        mimeType: 'image/png',
+        size: png.byteLength,
+        source: 'electron-clipboard',
+      };
+    }
+
+    const windowsImage = await readWindowsClipboardImageFromWSL();
+    if (!windowsImage) {
       return { ok: true, hasImage: false };
     }
 
-    const png = image.toPNG();
     return {
       ok: true,
       hasImage: true,
-      dataUrl: image.toDataURL(),
-      mimeType: 'image/png',
-      size: png.byteLength,
+      ...windowsImage,
     };
   } catch (err) {
     return { ok: false, error: err.message };
