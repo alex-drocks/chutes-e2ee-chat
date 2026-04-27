@@ -778,6 +778,14 @@ export default function ChatPage() {
     setCurrentStatus(undefined);
   }, [stopAiMessage]);
 
+  /**
+   * Retry the last assistant message after a failure.
+   *
+   * NOTE: This uses the *current* chat config (model, tools, images) at the
+   * moment retry is clicked. If the user changed the model between the original
+   * request and the retry, the retry will run with the newly selected model.
+   * This is intentional — the user expects the current settings to apply.
+   */
   const retryLastMessage = useCallback(() => {
     retryCountRef.current += 1;
     if (retryCountRef.current > MAX_RETRIES) {
