@@ -39,6 +39,18 @@ declare global {
     totalOutputTokens: number;
     averageTps: number;
     averageTtft: number;
+    timestamp?: string;
+    activeInstanceCount?: number;
+    totalInstanceCount?: number;
+    utilizationCurrent?: number;
+    utilization5m?: number;
+    utilization15m?: number;
+    utilization1h?: number;
+    rateLimitRatio5m?: number;
+    rateLimitRatio15m?: number;
+    rateLimitRatio1h?: number;
+    scalable?: boolean;
+    scaleAllowance?: number;
   };
 }
 

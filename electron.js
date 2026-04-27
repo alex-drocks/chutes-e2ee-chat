@@ -24,6 +24,7 @@ const API_KEY_PROVIDER = 'chutes';
 const MAX_API_KEY_LENGTH = 512;
 const CREDENTIALS_AAD = Buffer.from('chutes-e2ee-chat.credentials.v2');
 const MODEL_STATS_CACHE_TTL_MS = 30 * 60 * 1000;
+const MODEL_UTILIZATION_CACHE_TTL_MS = 2 * 60 * 1000;
 const MODEL_STATS_LOOKBACK_DAYS = 3;
 
 protocol.registerSchemesAsPrivileged([
@@ -405,7 +406,8 @@ async function pumpSSE(requestId, readableStream, sendToRenderer, cleanupRequest
 
 const activeControllers = new Map(); // requestId -> abort()
 const streamingWindows = new Map();  // requestId -> BrowserWindow
-let modelStatsCache = { loadedAt: 0, value: null, promise: null };
+let historicalModelStatsCache = { loadedAt: 0, value: null, promise: null };
+let modelUtilizationCache = { loadedAt: 0, value: null, promise: null };
 
 function toIsoDateDaysAgo(daysAgo) {
   const date = new Date();
@@ -442,14 +444,66 @@ function latestStatsByModel(rows) {
   return stats;
 }
 
-async function fetchModelStats() {
-  const now = Date.now();
-  if (modelStatsCache.value && now - modelStatsCache.loadedAt < MODEL_STATS_CACHE_TTL_MS) {
-    return modelStatsCache.value;
+function latestUtilizationByModel(rows) {
+  const utilization = {};
+
+  for (const row of rows) {
+    if (!row || typeof row.name !== 'string' || row.name.startsWith('[private')) continue;
+
+    const current = utilization[row.name];
+    if (current && String(current.timestamp) >= String(row.timestamp)) continue;
+
+    utilization[row.name] = {
+      chuteId: row.chute_id,
+      name: row.name,
+      timestamp: row.timestamp,
+      activeInstanceCount: finiteNumber(row.active_instance_count ?? row.instance_count),
+      totalInstanceCount: finiteNumber(row.total_instance_count ?? row.instance_count),
+      utilizationCurrent: finiteNumber(row.utilization_current),
+      utilization5m: finiteNumber(row.utilization_5m),
+      utilization15m: finiteNumber(row.utilization_15m),
+      utilization1h: finiteNumber(row.utilization_1h),
+      rateLimitRatio5m: finiteNumber(row.rate_limit_ratio_5m),
+      rateLimitRatio15m: finiteNumber(row.rate_limit_ratio_15m),
+      rateLimitRatio1h: finiteNumber(row.rate_limit_ratio_1h),
+      scalable: Boolean(row.scalable),
+      scaleAllowance: finiteNumber(row.scale_allowance),
+    };
   }
 
-  if (modelStatsCache.promise) {
-    return modelStatsCache.promise;
+  return utilization;
+}
+
+function mergeModelData(stats, utilization) {
+  const merged = { ...stats };
+
+  for (const [name, util] of Object.entries(utilization)) {
+    merged[name] = {
+      ...(merged[name] || {
+        chuteId: util.chuteId,
+        name,
+        date: '',
+        totalRequests: 0,
+        totalInputTokens: 0,
+        totalOutputTokens: 0,
+        averageTps: 0,
+        averageTtft: 0,
+      }),
+      ...util,
+    };
+  }
+
+  return merged;
+}
+
+async function fetchHistoricalModelStats() {
+  const now = Date.now();
+  if (historicalModelStatsCache.value && now - historicalModelStatsCache.loadedAt < MODEL_STATS_CACHE_TTL_MS) {
+    return historicalModelStatsCache.value;
+  }
+
+  if (historicalModelStatsCache.promise) {
+    return historicalModelStatsCache.promise;
   }
 
   const startDate = toIsoDateDaysAgo(MODEL_STATS_LOOKBACK_DAYS);
@@ -458,7 +512,7 @@ async function fetchModelStats() {
   url.searchParams.set('start_date', startDate);
   url.searchParams.set('end_date', endDate);
 
-  modelStatsCache.promise = fetch(url, {
+  historicalModelStatsCache.promise = fetch(url, {
     signal: AbortSignal.timeout(12_000),
     headers: { accept: 'application/json' },
   })
@@ -469,15 +523,64 @@ async function fetchModelStats() {
       const body = await response.json();
       const rows = Array.isArray(body) ? body : Array.isArray(body?.data) ? body.data : [];
       const value = latestStatsByModel(rows);
-      modelStatsCache = { loadedAt: Date.now(), value, promise: null };
+      historicalModelStatsCache = { loadedAt: Date.now(), value, promise: null };
       return value;
     })
     .catch((err) => {
-      modelStatsCache.promise = null;
+      historicalModelStatsCache.promise = null;
       throw err;
     });
 
-  return modelStatsCache.promise;
+  return historicalModelStatsCache.promise;
+}
+
+async function fetchModelUtilization() {
+  const now = Date.now();
+  if (modelUtilizationCache.value && now - modelUtilizationCache.loadedAt < MODEL_UTILIZATION_CACHE_TTL_MS) {
+    return modelUtilizationCache.value;
+  }
+
+  if (modelUtilizationCache.promise) {
+    return modelUtilizationCache.promise;
+  }
+
+  const url = new URL('/chutes/utilization', DEFAULT_API_BASE);
+
+  modelUtilizationCache.promise = fetch(url, {
+    signal: AbortSignal.timeout(12_000),
+    headers: { accept: 'application/json' },
+  })
+    .then(async (response) => {
+      if (!response.ok) {
+        throw new Error(`Utilization request failed: HTTP ${response.status}`);
+      }
+      const body = await response.json();
+      const rows = Array.isArray(body) ? body : Array.isArray(body?.data) ? body.data : [];
+      const value = latestUtilizationByModel(rows);
+      modelUtilizationCache = { loadedAt: Date.now(), value, promise: null };
+      return value;
+    })
+    .catch((err) => {
+      modelUtilizationCache.promise = null;
+      throw err;
+    });
+
+  return modelUtilizationCache.promise;
+}
+
+async function fetchModelStats() {
+  const [statsResult, utilizationResult] = await Promise.allSettled([
+    fetchHistoricalModelStats(),
+    fetchModelUtilization(),
+  ]);
+
+  if (statsResult.status === 'rejected' && utilizationResult.status === 'rejected') {
+    throw statsResult.reason || utilizationResult.reason;
+  }
+
+  const stats = statsResult.status === 'fulfilled' ? statsResult.value : {};
+  const utilization = utilizationResult.status === 'fulfilled' ? utilizationResult.value : {};
+  return mergeModelData(stats, utilization);
 }
 
 /** Send a chunk/error to the renderer for a given request. */

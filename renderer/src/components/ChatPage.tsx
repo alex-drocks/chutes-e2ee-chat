@@ -178,7 +178,8 @@ export default function ChatPage() {
     if (typeof window === 'undefined' || !window.chutes) return;
 
     let cancelled = false;
-    const timer = window.setTimeout(() => {
+    let interval: number | undefined;
+    const loadStats = () => {
       setModelStatsLoading(true);
       window.chutes.modelStats().then((res) => {
         if (cancelled) return;
@@ -197,11 +198,19 @@ export default function ChatPage() {
           setModelStatsLoading(false);
         }
       });
+    };
+
+    const timer = window.setTimeout(() => {
+      loadStats();
+      interval = window.setInterval(loadStats, 120_000);
     }, 1200);
 
     return () => {
       cancelled = true;
       window.clearTimeout(timer);
+      if (interval) {
+        window.clearInterval(interval);
+      }
     };
   }, []);
 
@@ -882,11 +891,13 @@ export default function ChatPage() {
   };
 
   const selectedModelStats = modelStats[model];
+  const modelInputValue = showModelMenu ? modelQuery : model;
+  const modelInputWidth = `${Math.max(modelInputValue.length + 1, 18)}ch`;
 
   return (
     <div className="flex flex-col h-screen bg-[var(--bg-primary)]">
       {/* Header */}
-      <header className="flex items-center justify-between px-6 py-3 border-b border-[var(--border)] bg-[var(--bg-secondary)]">
+      <header className="flex flex-wrap items-center justify-between gap-3 px-6 py-3 border-b border-[var(--border)] bg-[var(--bg-secondary)]">
         <div className="flex items-center gap-2">
           <Shield className="w-5 h-5 text-[var(--accent)]" />
           <h1 className="text-lg font-semibold text-[var(--text-primary)]">
@@ -894,7 +905,7 @@ export default function ChatPage() {
           </h1>
         </div>
 
-        <div className="flex items-center gap-2">
+        <div className="flex min-w-0 flex-wrap items-center justify-end gap-2">
           {/* Model picker */}
           <div className="relative" ref={menuRef}>
             <div
@@ -903,7 +914,7 @@ export default function ChatPage() {
               aria-controls="model-options"
               aria-haspopup="listbox"
               aria-activedescendant={showModelMenu && filteredModels.length > 0 ? `model-option-${highlightedModelIndex}` : undefined}
-              className="flex h-9 w-[420px] max-w-[48vw] items-center gap-2 rounded-lg bg-[var(--bg-tertiary)] px-3 text-sm text-[var(--text-secondary)] transition-colors focus-within:ring-1 focus-within:ring-[var(--accent)] hover:text-[var(--text-primary)]"
+              className="flex min-h-9 max-w-full items-center gap-2 rounded-lg bg-[var(--bg-tertiary)] px-3 py-1.5 text-sm text-[var(--text-secondary)] transition-colors focus-within:ring-1 focus-within:ring-[var(--accent)] hover:text-[var(--text-primary)]"
               onMouseDown={(e) => {
                 if (e.target === e.currentTarget) {
                   e.preventDefault();
@@ -915,7 +926,7 @@ export default function ChatPage() {
               <Sparkles className="w-3.5 h-3.5" />
               <input
                 ref={modelInputRef}
-                value={showModelMenu ? modelQuery : model}
+                value={modelInputValue}
                 onFocus={openModelMenu}
                 onChange={(e) => {
                   setModelQuery(e.target.value);
@@ -924,7 +935,8 @@ export default function ChatPage() {
                 }}
                 onKeyDown={handleModelKeyDown}
                 aria-autocomplete="list"
-                className="min-w-0 flex-1 bg-transparent text-sm text-[var(--text-primary)] outline-none placeholder-[var(--text-secondary)]"
+                className="bg-transparent text-sm text-[var(--text-primary)] outline-none placeholder-[var(--text-secondary)]"
+                style={{ width: modelInputWidth }}
                 placeholder="Search models"
                 spellCheck={false}
               />
@@ -952,7 +964,7 @@ export default function ChatPage() {
               </button>
             </div>
             {showModelMenu && (
-              <div id="model-options" role="listbox" className="absolute right-0 top-full mt-1 w-[420px] max-w-[80vw] rounded-lg bg-[var(--bg-secondary)] border border-[var(--border)] shadow-xl z-50 py-1 max-h-80 overflow-auto">
+              <div id="model-options" role="listbox" className="absolute right-0 top-full mt-1 min-w-full w-max max-w-[calc(100vw-2rem)] rounded-lg bg-[var(--bg-secondary)] border border-[var(--border)] shadow-xl z-50 py-1 max-h-80 overflow-auto">
                 {filteredModels.length > 0 ? (
                   filteredModels.map((m, i) => {
                     const active = i === highlightedModelIndex;
@@ -966,12 +978,12 @@ export default function ChatPage() {
                         onMouseEnter={() => setHighlightedModelIndex(i)}
                         onMouseDown={(e) => e.preventDefault()}
                         onClick={() => selectModel(m)}
-                        className={`flex w-full items-center justify-between gap-3 px-3 py-2 text-left text-sm transition-colors ${
+                        className={`flex w-full items-center justify-between gap-4 px-3 py-2 text-left text-sm transition-colors ${
                           active ? 'bg-[var(--bg-tertiary)]' : ''
                         } ${selected ? 'text-[var(--accent)]' : 'text-[var(--text-secondary)]'}`}
                       >
-                        <span className="min-w-0 flex-1 truncate">{m}</span>
-                        <span className="flex shrink-0 items-center gap-2">
+                        <span className="whitespace-normal break-words">{m}</span>
+                        <span className="flex shrink-0 items-center gap-2 whitespace-nowrap">
                           <ModelStatsLine stats={modelStats[m]} />
                           {selected && <Check className="w-3.5 h-3.5 shrink-0" />}
                         </span>
@@ -1202,6 +1214,11 @@ function formatStatsNumber(value: number, options: { suffix?: string } = {}) {
   return `${formatted}${options.suffix || ''}`;
 }
 
+function formatUtilization(value?: number) {
+  if (!Number.isFinite(value) || value === undefined || value < 0) return null;
+  return `${Math.round(value * 100)}% Util`;
+}
+
 function ModelStatsLine({
   stats,
   loading = false,
@@ -1223,18 +1240,30 @@ function ModelStatsLine({
     return null;
   }
 
+  const instances = Number.isFinite(stats.activeInstanceCount)
+    ? `${stats.activeInstanceCount} ${stats.activeInstanceCount === 1 ? 'instance' : 'instances'}`
+    : null;
+  const utilization = formatUtilization(stats.utilizationCurrent);
   const tps = formatStatsNumber(stats.averageTps);
   const ttft = formatStatsNumber(stats.averageTtft, { suffix: 's' });
-  if (!tps && !ttft) return null;
+  const parts = [
+    instances,
+    utilization,
+    tps ? `${tps} TPS` : null,
+    ttft ? `${ttft} TTFT` : null,
+  ].filter(Boolean);
+  if (parts.length === 0) return null;
 
   return (
     <span
-      className={`text-[10px] leading-tight text-[var(--text-secondary)] opacity-70 ${className}`}
-      title={`Daily average from ${stats.date}${stats.totalRequests ? ` across ${stats.totalRequests.toLocaleString()} requests` : ''}`}
+      className={`whitespace-nowrap text-[10px] leading-tight text-[var(--text-secondary)] opacity-75 ${className}`}
+      title={[
+        stats.timestamp ? `Utilization updated ${stats.timestamp}` : '',
+        stats.date ? `TPS/TTFT daily average from ${stats.date}` : '',
+        stats.totalRequests ? `${stats.totalRequests.toLocaleString()} requests` : '',
+      ].filter(Boolean).join(' · ')}
     >
-      {tps ? `${tps} TPS` : 'TPS n/a'}
-      {' · '}
-      {ttft ? `${ttft} TTFT` : 'TTFT n/a'}
+      {parts.join(' · ')}
     </span>
   );
 }
