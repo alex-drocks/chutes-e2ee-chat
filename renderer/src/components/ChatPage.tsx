@@ -1682,14 +1682,22 @@ function collectReasoning(parts: ChutesUIMessage['parts']) {
 function collectToolParts(parts: ChutesUIMessage['parts']) {
   return parts
     .filter((part) => part.type === 'dynamic-tool' || part.type.startsWith('tool-'))
-    .map((part: any) => ({
-      toolCallId: String(part.toolCallId || part.id || crypto.randomUUID()),
-      toolName: String(part.type === 'dynamic-tool' ? part.toolName : part.type.replace(/^tool-/, '')),
-      input: part.input as { query?: string } | undefined,
-      output: part.output,
-      errorText: part.errorText,
-      state: String(part.state || ''),
-    }));
+    .map((part: any) => {
+      const toolCallId = part.toolCallId || part.id;
+      if (!toolCallId) {
+        console.warn('collectToolParts: tool part missing both toolCallId and id — skipping');
+        return null;
+      }
+      return {
+        toolCallId: String(toolCallId),
+        toolName: String(part.type === 'dynamic-tool' ? part.toolName : part.type.replace(/^tool-/, '')),
+        input: part.input as { query?: string } | undefined,
+        output: part.output,
+        errorText: part.errorText,
+        state: String(part.state || ''),
+      };
+    })
+    .filter(Boolean) as any[];
 }
 
 function extractSources(toolParts: ReturnType<typeof collectToolParts>): SourceItem[] {
