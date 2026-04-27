@@ -63,6 +63,30 @@ type ApiKeyStatus = {
   isOsBackedStorage?: boolean;
 };
 
+type ChatApiMessage = {
+  role: string;
+  content?: string | ChutesMessageContentPart[] | null;
+  tool_calls?: ChutesToolCall[];
+  tool_call_id?: string;
+  name?: string;
+};
+
+type ActiveToolContext = {
+  model: string;
+  messages: ChatApiMessage[];
+  toolsEnabled: boolean;
+  toolDepth: number;
+};
+
+type PendingToolCall = {
+  id: string;
+  type: 'function';
+  function: {
+    name: string;
+    arguments: string;
+  };
+};
+
 const EMPTY_API_KEY_STATUS: ApiKeyStatus = {
   hasApiKey: false,
   hasStoredKey: false,
@@ -118,6 +142,11 @@ export default function ChatPage() {
   const lastUserInputRef = useRef('');
   const memoryStoreRef = useRef<MemoryStore>(new MemoryStore());
   const isRecoveringRef = useRef(false);
+  const activeToolContextRef = useRef<ActiveToolContext | null>(null);
+  const pendingToolCallsRef = useRef<Map<number, PendingToolCall>>(new Map());
+  const textToolBufferRef = useRef('');
+  const assistantToolContentRef = useRef<string | null>(null);
+  const currentAssistantContentRef = useRef('');
 
   const setModel = useCallback((nextModel: string) => {
     setModelState(nextModel);
@@ -332,6 +361,121 @@ export default function ChatPage() {
     el.style.height = `${Math.min(el.scrollHeight, 128)}px`;
   }, [input]);
 
+  async function continueAfterToolCalls() {
+    const context = activeToolContextRef.current;
+    if (!context || !context.toolsEnabled) return false;
+
+    const pendingToolCalls = Array.from(pendingToolCallsRef.current.values())
+      .filter((toolCall) => toolCall.id && toolCall.function.name)
+      .map((toolCall) => ({
+        ...toolCall,
+        function: {
+          ...toolCall.function,
+          name: normalizeToolName(toolCall.function.name),
+        },
+      }));
+    pendingToolCallsRef.current = new Map();
+
+    if (pendingToolCalls.length === 0) return false;
+
+    if (context.toolDepth >= 3) {
+      finalizeError('Tool call limit reached before the model produced a final answer.');
+      return true;
+    }
+
+    appendStatusHistory({
+      done: false,
+      action: 'tool_call',
+      description: pendingToolCalls.length === 1
+        ? `Calling ${pendingToolCalls[0].function.name}…`
+        : `Calling ${pendingToolCalls.length} tools…`,
+      timestamp: Date.now(),
+    });
+    setStreamStage('connecting');
+    setCurrentStatus({ done: false, action: 'tool_call', description: 'Running model-requested tool…', timestamp: Date.now() });
+
+    const toolMessages: ChatApiMessage[] = [];
+    for (const toolCall of pendingToolCalls) {
+      const result = await executeToolCall(toolCall);
+      toolMessages.push({
+        role: 'tool',
+        tool_call_id: toolCall.id,
+        name: normalizeToolName(toolCall.function.name),
+        content: JSON.stringify(result),
+      });
+    }
+
+    appendStatusHistory({
+      done: true,
+      action: 'tool_result',
+      description: 'Tool result returned to model',
+      timestamp: Date.now(),
+      level: 'success',
+    });
+
+    const nextMessages: ChatApiMessage[] = [
+      ...context.messages,
+      { role: 'assistant', content: assistantToolContentRef.current || null, tool_calls: pendingToolCalls },
+      ...toolMessages,
+    ];
+    const nextContext = {
+      ...context,
+      messages: nextMessages,
+      toolDepth: context.toolDepth + 1,
+    };
+    activeToolContextRef.current = nextContext;
+    assistantToolContentRef.current = null;
+
+    const id = crypto.randomUUID();
+    setRequestId(id);
+    requestIdRef.current = id;
+    hasContentRef.current = false;
+    setStreamStage('encrypting');
+    setCurrentStatus({ done: false, action: 'encrypting', description: 'Encrypting tool results for TEE…', timestamp: Date.now() });
+
+    try {
+      setStreamStage('connecting');
+      setCurrentStatus({ done: false, action: 'connecting', description: 'Continuing with tool results…', timestamp: Date.now() });
+      const res = await window.chutes.chat(id, {
+        model: nextContext.model,
+        messages: nextMessages,
+        stream: true,
+        tools: buildStandardTools(),
+        tool_choice: 'auto',
+      });
+      if (!res.ok) {
+        finalizeError(res.error);
+        return true;
+      }
+      setCurrentStatus({ done: false, action: 'thinking', description: 'Waiting for response…', timestamp: Date.now() });
+    } catch (err: any) {
+      finalizeError(err?.message);
+    }
+
+    return true;
+  }
+
+  function bufferTextToolContent(content: string) {
+    if (!content) return '';
+
+    const marker = '<|tool_calls_section_begin|>';
+    if (textToolBufferRef.current) {
+      textToolBufferRef.current += content;
+      return '';
+    }
+
+    const markerIndex = content.indexOf(marker);
+    if (markerIndex === -1) return content;
+
+    textToolBufferRef.current = content.slice(markerIndex);
+    return content.slice(0, markerIndex);
+  }
+
+  function getLastAssistantContent() {
+    const content = currentAssistantContentRef.current.trim();
+    return content ? content : null;
+  }
+
   /* ── Register stream listeners ──────────────────────────────────────────── */
   useEffect(() => {
     if (typeof window === 'undefined' || !window.chutes) return;
@@ -340,6 +484,22 @@ export default function ChatPage() {
       if (requestIdRef.current && payload.requestId !== requestIdRef.current) return;
 
       if (payload.done) {
+        const textToolCalls = extractTextToolCalls(textToolBufferRef.current);
+        if (textToolCalls.toolCalls.length > 0) {
+          queuePendingToolCalls(textToolCalls.toolCalls, pendingToolCallsRef.current);
+          assistantToolContentRef.current = getLastAssistantContent();
+          textToolBufferRef.current = '';
+        }
+
+        if (pendingToolCallsRef.current.size > 0) {
+          void continueAfterToolCalls().then((handled) => {
+            if (!handled) {
+              finalizeError('The model requested a tool, but no active tool context was available.');
+            }
+          });
+          return;
+        }
+
         setIsLoading(false);
         setStreamStage('idle');
         setCurrentStatus(undefined);
@@ -371,11 +531,17 @@ export default function ChatPage() {
 
         setRequestId(null);
         requestIdRef.current = null;
+        activeToolContextRef.current = null;
+        pendingToolCallsRef.current = new Map();
+        textToolBufferRef.current = '';
+        assistantToolContentRef.current = null;
+        currentAssistantContentRef.current = '';
         retryCountRef.current = 0;
         return;
       }
 
       if (!payload.data) return;
+      if (payload.data === '[DONE]') return;
 
       try {
         const parsed = JSON.parse(payload.data);
@@ -384,17 +550,29 @@ export default function ChatPage() {
         if (delta) {
           const content = delta.content || '';
           const reasoning = delta.reasoning_content || delta.reasoning || '';
+          const toolCalls = delta.tool_calls || [];
+          const visibleContent = bufferTextToolContent(content);
 
-          if (content || reasoning) {
+          if (content || reasoning || toolCalls.length > 0) {
             hasContentRef.current = true;
+          }
+
+          if (toolCalls.length > 0) {
+            accumulateToolCallDeltas(toolCalls, pendingToolCallsRef.current);
+            setStreamStage('thinking');
+            setCurrentStatus({ done: false, action: 'tool_call', description: 'Model is preparing a tool call…', timestamp: Date.now() });
           }
 
           if (reasoning && !content) {
             setStreamStage('thinking');
             setCurrentStatus({ done: false, action: 'thinking', description: 'Streaming model reasoning…', timestamp: Date.now() });
-          } else if (content) {
+          } else if (visibleContent) {
             setStreamStage('streaming');
             setCurrentStatus({ done: false, action: 'streaming', description: 'Streaming response…', timestamp: Date.now() });
+          }
+
+          if (visibleContent) {
+            currentAssistantContentRef.current += visibleContent;
           }
 
           setMessages((prev) => {
@@ -404,7 +582,7 @@ export default function ChatPage() {
               ...prev.slice(0, -1),
               {
                 ...last,
-                content: last.content + content,
+                content: last.content + visibleContent,
                 reasoning: last.reasoning
                   ? last.reasoning + reasoning
                   : reasoning || undefined,
@@ -602,6 +780,11 @@ export default function ChatPage() {
 
     setRequestId(null);
     requestIdRef.current = null;
+    activeToolContextRef.current = null;
+    pendingToolCallsRef.current = new Map();
+    textToolBufferRef.current = '';
+    assistantToolContentRef.current = null;
+    currentAssistantContentRef.current = '';
     recoveryAttemptsRef.current = 0;
     recoveryQueueRef.current = [];
   }
@@ -657,23 +840,10 @@ export default function ChatPage() {
 
       setIsLoading(true);
       hasContentRef.current = false;
-      let searchContext = '';
-      if (webSearchEnabled && !opts?.retry) {
-        setStreamStage('connecting');
-        setCurrentStatus({ done: false, action: 'searching', description: 'Searching the web…', timestamp: Date.now() });
-        const searchRes = await window.chutes.webSearch(text);
-        if (searchRes.ok && searchRes.results?.length) {
-          searchContext = formatSearchContext(text, searchRes.results);
-        } else if (searchRes.error) {
-          appendStatusHistory({
-            done: true,
-            action: 'searching',
-            description: `Web search unavailable: ${searchRes.error}`,
-            timestamp: Date.now(),
-            level: 'warning',
-          });
-        }
-      }
+      pendingToolCallsRef.current = new Map();
+      textToolBufferRef.current = '';
+      assistantToolContentRef.current = null;
+      currentAssistantContentRef.current = '';
 
       setStreamStage('encrypting');
       setCurrentStatus({ done: false, action: 'encrypting', description: 'Encrypting message for TEE…', timestamp: Date.now() });
@@ -685,24 +855,35 @@ export default function ChatPage() {
       // Prepare conversation history
       let history = messages
         .filter((m) => !m.isStreaming && !m.isError && !m.isEmpty)
-        .map((m) => ({ role: m.role, content: m.content }));
+        .map((m) => ({ role: m.role, content: m.content } as ChatApiMessage));
+
+      const requestMessages: ChatApiMessage[] = [
+        ...buildToolSystemMessages(webSearchEnabled),
+        ...history,
+        {
+          role: 'user',
+          content: buildUserApiContent({
+            text,
+            attachments: attachmentSnapshot,
+            memoryContext,
+            searchContext: '',
+            includeImages: selectedModelAcceptsImages,
+          }),
+        },
+      ];
+
+      activeToolContextRef.current = {
+        model,
+        messages: requestMessages,
+        toolsEnabled: webSearchEnabled,
+        toolDepth: 0,
+      };
 
       const params = {
         model,
-        messages: [
-          ...history,
-          {
-            role: 'user',
-            content: buildUserApiContent({
-              text,
-              attachments: attachmentSnapshot,
-              memoryContext,
-              searchContext,
-              includeImages: selectedModelAcceptsImages,
-            }),
-          },
-        ],
+        messages: requestMessages,
         stream: true,
+        ...(webSearchEnabled ? { tools: buildStandardTools(), tool_choice: 'auto' } : {}),
       };
 
       try {
@@ -1382,11 +1563,159 @@ function formatFileSize(bytes: number) {
   return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 }
 
-function formatSearchContext(query: string, results: ChutesWebSearchResult[]) {
-  const lines = results.map((result, index) => (
-    `${index + 1}. ${result.title}\nURL: ${result.url}\n${result.snippet}`
-  ));
-  return `Web search results for "${query}":\n\n${lines.join('\n\n')}`;
+function buildToolSystemMessages(toolsEnabled: boolean): ChatApiMessage[] {
+  if (!toolsEnabled) return [];
+  return [
+    {
+      role: 'system',
+      content:
+        `Current date: ${new Date().toISOString()}.\n` +
+        'You have access to standard function tools. Use web_search when live, recent, source-backed, or changing information is needed. ' +
+        'Tool results are fetched by the app from the live web and returned as role:tool messages; they are not a simulated search transcript. ' +
+        'Use the returned URLs/snippets when relevant and cite sources in plain text.',
+    },
+  ];
+}
+
+function buildStandardTools(): ChutesToolDefinition[] {
+  return [
+    {
+      type: 'function',
+      function: {
+        name: 'web_search',
+        description:
+          'Search the live web for current or source-backed information. Returns titles, URLs, and snippets.',
+        parameters: {
+          type: 'object',
+          properties: {
+            query: {
+              type: 'string',
+              description: 'The web search query to run.',
+            },
+          },
+          required: ['query'],
+          additionalProperties: false,
+        },
+      },
+    },
+  ];
+}
+
+function accumulateToolCallDeltas(toolCalls: any[], pending: Map<number, PendingToolCall>) {
+  for (const delta of toolCalls) {
+    const index = Number.isInteger(delta.index) ? delta.index : 0;
+    const current = pending.get(index) || {
+      id: '',
+      type: 'function' as const,
+      function: { name: '', arguments: '' },
+    };
+
+    if (delta.id) current.id = delta.id;
+    if (delta.type) current.type = delta.type;
+    if (delta.function?.name) {
+      const namePart = String(delta.function.name);
+      current.function.name = current.function.name.endsWith(namePart)
+        ? current.function.name
+        : current.function.name + namePart;
+    }
+    if (delta.function?.arguments) {
+      current.function.arguments += delta.function.arguments;
+    }
+
+    pending.set(index, current);
+  }
+}
+
+function extractTextToolCalls(content: string) {
+  const toolCalls: PendingToolCall[] = [];
+  if (!content.includes('<|tool_calls_section_begin|>')) {
+    return { cleanContent: content, toolCalls };
+  }
+
+  let callIndex = 0;
+  const sectionPattern = /<\|tool_calls_section_begin\|>[\s\S]*?<\|tool_calls_section_end\|>/g;
+  const cleanContent = content.replace(sectionPattern, '').trimEnd();
+  for (const sectionMatch of content.matchAll(sectionPattern)) {
+    const section = sectionMatch[0];
+    const callPattern = /<\|tool_call_begin\|>\s*([^\s<]+?)(?::\d+)?\s*<\|tool_call_argument_begin\|>\s*([\s\S]*?)\s*<\|tool_call_end\|>/g;
+    for (const callMatch of section.matchAll(callPattern)) {
+      toolCalls.push({
+        id: `text-tool-${Date.now()}-${callIndex}`,
+        type: 'function',
+        function: {
+          name: normalizeToolName(callMatch[1]),
+          arguments: callMatch[2].trim(),
+        },
+      });
+      callIndex += 1;
+    }
+  }
+
+  return { cleanContent, toolCalls };
+}
+
+function queuePendingToolCalls(toolCalls: PendingToolCall[], pending: Map<number, PendingToolCall>) {
+  const startIndex = pending.size;
+  toolCalls.forEach((toolCall, offset) => {
+    pending.set(startIndex + offset, toolCall);
+  });
+}
+
+function normalizeToolName(name: string) {
+  return name.replace(/^functions\./, '').replace(/:\d+$/, '').trim();
+}
+
+async function executeToolCall(toolCall: PendingToolCall) {
+  const name = normalizeToolName(toolCall.function.name);
+  if (name !== 'web_search') {
+    return {
+      ok: false,
+      tool: name,
+      error: `Unsupported tool: ${name}`,
+    };
+  }
+
+  let args: { query?: string } = {};
+  try {
+    args = JSON.parse(toolCall.function.arguments || '{}');
+  } catch {
+    return {
+      ok: false,
+      tool: name,
+      error: 'Tool arguments were not valid JSON.',
+      rawArguments: toolCall.function.arguments,
+    };
+  }
+
+  const query = typeof args.query === 'string' ? args.query.trim() : '';
+  if (!query) {
+    return {
+      ok: false,
+      tool: name,
+      error: 'web_search requires a non-empty query string.',
+    };
+  }
+
+  const result = await window.chutes.webSearch(query);
+  if (!result.ok) {
+    return {
+      ok: false,
+      tool: name,
+      query,
+      error: result.error || 'Web search failed.',
+      fetchedAt: new Date().toISOString(),
+    };
+  }
+
+  return {
+    ok: true,
+    tool: name,
+    query,
+    source: 'live_web_search',
+    provider: result.provider || 'web search',
+    fetchedAt: result.fetchedAt || new Date().toISOString(),
+    results: result.results || [],
+  };
 }
 
 function buildUserApiContent({

@@ -713,7 +713,7 @@ ipcMain.handle('chutes:webSearch', async (event, { query }) => {
 
     const html = await response.text();
     const results = parseDuckDuckGoResults(html).slice(0, 5);
-    return { ok: true, results };
+    return { ok: true, results, fetchedAt: new Date().toISOString(), provider: 'DuckDuckGo' };
   } catch (err) {
     return { ok: false, error: err.message };
   }

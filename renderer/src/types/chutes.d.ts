@@ -3,14 +3,22 @@ declare global {
     chutes: {
       chat: (requestId: string, params: {
         model: string;
-        messages: Array<{ role: string; content: string | ChutesMessageContentPart[] }>;
+        messages: Array<{
+          role: string;
+          content?: string | ChutesMessageContentPart[] | null;
+          tool_calls?: ChutesToolCall[];
+          tool_call_id?: string;
+          name?: string;
+        }>;
         stream?: boolean;
         max_tokens?: number;
+        tools?: ChutesToolDefinition[];
+        tool_choice?: 'auto' | 'none' | string | Record<string, unknown>;
       }) => Promise<{ ok: boolean; stream?: boolean; body?: any; error?: string }>;
       abort: (requestId: string) => void;
       models: () => Promise<{ ok: boolean; models?: string[]; metadata?: ChutesModelMetadata[]; error?: string }>;
       modelStats: () => Promise<{ ok: boolean; stats?: Record<string, ChutesModelStats>; error?: string }>;
-      webSearch: (query: string) => Promise<{ ok: boolean; results?: ChutesWebSearchResult[]; error?: string }>;
+      webSearch: (query: string) => Promise<{ ok: boolean; results?: ChutesWebSearchResult[]; fetchedAt?: string; provider?: string; error?: string }>;
       onStreamChunk: (callback: (payload: { requestId: string; data?: string; done?: boolean }) => void) => () => void;
       onStreamError: (callback: (payload: { requestId: string; error: string }) => void) => () => void;
       saveApiKey: (provider: string, apiKey: string) => Promise<ApiKeyStatusResponse>;
@@ -74,6 +82,24 @@ declare global {
   type ChutesMessageContentPart =
     | { type: 'text'; text: string }
     | { type: 'image_url'; image_url: { url: string } };
+
+  type ChutesToolCall = {
+    id: string;
+    type: 'function';
+    function: {
+      name: string;
+      arguments: string;
+    };
+  };
+
+  type ChutesToolDefinition = {
+    type: 'function';
+    function: {
+      name: string;
+      description?: string;
+      parameters?: Record<string, unknown>;
+    };
+  };
 }
 
 export {};
