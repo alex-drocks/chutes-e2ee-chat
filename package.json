@@ -12,16 +12,16 @@
     "build": "npm run build:renderer",
     "start": "electron .",
     "postinstall": "cd renderer && npm install",
+    "test": "npm run test:unit && npm run test:live",
+    "test:ci": "node --test tests/protocol.regression.test.js tests/crypto.unit.test.js tests/retry.unit.test.js",
     "test:unit": "node --test tests/protocol.regression.test.js tests/crypto.unit.test.js tests/retry.unit.test.js",
-    "test:live": "node --test tests/e2ee-integration.test.js tests/cors-free.test.js tests/e2ee-comprehensive.test.js tests/e2ee-stress.test.js",
-    "test": "npm run test:unit && npm run test:live"
+    "test:live": "node --test tests/e2ee-integration.test.js tests/cors-free.test.js tests/e2ee-comprehensive.test.js tests/e2ee-stress.test.js"
   },
   "dependencies": {
     "electron": "^41.3.0",
     "mlkem": "^2.7.0",
     "@stablelib/chacha20poly1305": "^2.0.1",
-    "dotenv": "^17.4.2",
-    "undici-types": "^6.21.1"
+    "dotenv": "^17.4.2"
   },
   "devDependencies": {
     "concurrently": "^9.2.1",

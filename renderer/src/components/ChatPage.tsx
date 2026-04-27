@@ -183,8 +183,8 @@ export default function ChatPage() {
   }, [input, isLoading, messages, model]);
 
   const abort = useCallback(() => {
-    if (requestId) {
-      window.chutes.abort(requestId);
+    if (requestIdRef.current) {
+      window.chutes.abort(requestIdRef.current);
       setIsLoading(false);
       setRequestId(null);
       requestIdRef.current = null;
@@ -192,7 +192,7 @@ export default function ChatPage() {
         prev.map((m, i) => (i === prev.length - 1 && m.isStreaming ? { ...m, isStreaming: false } : m)),
       );
     }
-  }, [requestId]);
+  }, []);
 
   const saveKey = async () => {
     if (!apiKey.trim()) return;

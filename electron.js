@@ -12,6 +12,7 @@ import { fileURLToPath } from 'node:url';
 import fs from 'node:fs';
 
 import { ChutesE2EETransport } from './lib/chutes/ChutesE2EETransport.js';
+import { DEFAULT_MODELS_BASE } from './lib/chutes/constants.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const isDev = !app.isPackaged;
@@ -35,10 +36,10 @@ async function loadCredentials() {
 }
 
 async function saveCredentials(creds) {
-  const data = Buffer.from(JSON.stringify(creds));
+  const payload = JSON.stringify(creds);
   const encrypted = safeStorage.isEncryptionAvailable()
-    ? safeStorage.encryptString(JSON.stringify(creds))
-    : data;
+    ? safeStorage.encryptString(payload)
+    : Buffer.from(payload);
   await fs.promises.writeFile(CREDENTIALS_FILE, encrypted);
 }
 
@@ -53,12 +54,16 @@ async function getTransport() {
 
   const creds = await loadCredentials();
   const apiKey = process.env.CHUTES_API_KEY || creds.chutesApiKey || '';
-  transport = new ChutesE2EETransport({ apiKey });
+  transport = new ChutesE2EETransport({ apiKey, modelsBase: DEFAULT_MODELS_BASE });
   return transport;
 }
 
-function resetTransport(apiKey) {
-  transport = new ChutesE2EETransport({ apiKey });
+function setApiKey(apiKey) {
+  if (transport) {
+    transport.setApiKey(apiKey);
+  } else {
+    transport = new ChutesE2EETransport({ apiKey, modelsBase: DEFAULT_MODELS_BASE });
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -107,7 +112,7 @@ app.on('window-all-closed', () => {
  * Pump an SSE readable stream into renderer IPC events.
  * Guards against window destruction (race on abort/close).
  */
-async function pumpSSE(requestId, readableStream, send, done) {
+async function pumpSSE(requestId, readableStream, sendToRenderer, cleanupRequestFn) {
   const reader = readableStream.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
@@ -124,22 +129,23 @@ async function pumpSSE(requestId, readableStream, send, done) {
       for (const line of lines) {
         const trimmed = line.trim();
         if (trimmed.startsWith('data: ')) {
-          send({ requestId, data: trimmed.slice(6), done: false });
+          sendToRenderer(requestId, { requestId, data: trimmed.slice(6), done: false });
         }
       }
     }
 
     // Flush remaining buffer
     if (buffer.trim().startsWith('data: ')) {
-      send({ requestId, data: buffer.trim().slice(6), done: false });
+      sendToRenderer(requestId, { requestId, data: buffer.trim().slice(6), done: false });
     }
   } catch (err) {
     if (err.name !== 'AbortError') {
-      send({ requestId, error: err.message, done: true });
+      sendToRenderer(requestId, { requestId, error: err.message, done: true });
     }
   } finally {
     reader.releaseLock();
-    done(requestId);
+    sendToRenderer(requestId, { requestId, done: true });
+    cleanupRequestFn(requestId);
   }
 }
 
@@ -179,12 +185,7 @@ ipcMain.handle('chutes:chat', async (event, { requestId, params }) => {
     activeControllers.set(requestId, abort);
 
     if (params.stream) {
-      const send = (p) => sendToRenderer(requestId, p);
-      const done = () => {
-        sendToRenderer(requestId, { requestId, done: true });
-        cleanupRequest(requestId);
-      };
-      pumpSSE(requestId, response.body, send, () => cleanupRequest(requestId));
+      pumpSSE(requestId, response.body, sendToRenderer, cleanupRequest);
       return { ok: true, stream: true };
     }
 
@@ -198,11 +199,8 @@ ipcMain.handle('chutes:chat', async (event, { requestId, params }) => {
 });
 
 ipcMain.handle('chutes:abort', (_event, { requestId }) => {
-  const abort = activeControllers.get(requestId);
-  if (abort) {
-    abort();
-    cleanupRequest(requestId);
-  }
+  activeControllers.get(requestId)?.();
+  cleanupRequest(requestId);
 });
 
 ipcMain.handle('chutes:models', async () => {
@@ -223,7 +221,7 @@ ipcMain.handle('settings:saveApiKey', async (_event, { provider, apiKey }) => {
     const creds = await loadCredentials();
     creds.chutesApiKey = apiKey;
     await saveCredentials(creds);
-    resetTransport(apiKey);
+    setApiKey(apiKey);
     return { ok: true };
   } catch (err) {
     return { ok: false, error: err.message };
