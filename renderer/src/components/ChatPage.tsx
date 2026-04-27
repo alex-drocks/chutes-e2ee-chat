@@ -332,7 +332,6 @@ export default function ChatPage() {
         model: strategy.model,
         messages: [...history, { role: 'user', content: userText }],
         stream: true,
-        max_tokens: 2048,
       };
 
       try {
@@ -460,7 +459,6 @@ export default function ChatPage() {
         model,
         messages: [...history, { role: 'user', content: text }],
         stream: true,
-        max_tokens: 2048,
       };
 
       // Phase 3: Inject memory context into the user message if present
