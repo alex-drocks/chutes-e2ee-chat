@@ -636,10 +636,15 @@ function sendToRenderer(requestId, payload) {
   const win = streamingWindows.get(requestId);
   if (!win || win.isDestroyed()) return false;
 
-  if (payload.error) {
-    win.webContents.send('chutes:error', payload);
-  } else {
-    win.webContents.send('chutes:chunk', payload);
+  try {
+    if (payload.error) {
+      win.webContents.send('chutes:error', payload);
+    } else {
+      win.webContents.send('chutes:chunk', payload);
+    }
+  } catch {
+    // Window destroyed between the isDestroyed() check and the send
+    return false;
   }
   return true;
 }
