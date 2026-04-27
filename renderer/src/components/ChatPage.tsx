@@ -1699,9 +1699,20 @@ function extractSources(toolParts: ReturnType<typeof collectToolParts>): SourceI
     if (!Array.isArray(results)) continue;
     for (const result of results) {
       if (typeof result?.url !== 'string') continue;
-      sources.set(result.url, {
-        title: typeof result.title === 'string' ? result.title : result.url,
-        url: result.url,
+
+      // Sanitize URL: reject non-HTTP(S) schemes to prevent javascript: injection
+      let url: string;
+      try {
+        const parsed = new URL(result.url.trim());
+        if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') continue;
+        url = parsed.href;
+      } catch {
+        continue;
+      }
+
+      sources.set(url, {
+        title: typeof result.title === 'string' ? result.title : url,
+        url,
       });
     }
   }
