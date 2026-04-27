@@ -964,32 +964,42 @@ export default function ChatPage() {
               </button>
             </div>
             {showModelMenu && (
-              <div id="model-options" role="listbox" className="absolute right-0 top-full mt-1 min-w-full w-max max-w-[calc(100vw-2rem)] rounded-lg bg-[var(--bg-secondary)] border border-[var(--border)] shadow-xl z-50 py-1 max-h-80 overflow-auto">
+              <div id="model-options" role="listbox" className="absolute right-0 top-full mt-1 w-[min(980px,calc(100vw-2rem))] rounded-lg bg-[var(--bg-secondary)] border border-[var(--border)] shadow-xl z-50 max-h-80 overflow-auto">
                 {filteredModels.length > 0 ? (
-                  filteredModels.map((m, i) => {
-                    const active = i === highlightedModelIndex;
-                    const selected = m === model;
-                    return (
-                      <button
-                        key={m}
-                        id={`model-option-${i}`}
-                        role="option"
-                        aria-selected={selected}
-                        onMouseEnter={() => setHighlightedModelIndex(i)}
-                        onMouseDown={(e) => e.preventDefault()}
-                        onClick={() => selectModel(m)}
-                        className={`flex w-full items-center justify-between gap-4 px-3 py-2 text-left text-sm transition-colors ${
-                          active ? 'bg-[var(--bg-tertiary)]' : ''
-                        } ${selected ? 'text-[var(--accent)]' : 'text-[var(--text-secondary)]'}`}
-                      >
-                        <span className="whitespace-normal break-words">{m}</span>
-                        <span className="flex shrink-0 items-center gap-2 whitespace-nowrap">
-                          <ModelStatsLine stats={modelStats[m]} />
-                          {selected && <Check className="w-3.5 h-3.5 shrink-0" />}
-                        </span>
-                      </button>
-                    );
-                  })
+                  <>
+                    <div className="grid min-w-[760px] grid-cols-[minmax(22rem,1fr)_7rem_6rem_6rem_7rem_1.5rem] gap-4 border-b border-[var(--border)] px-3 py-1.5 text-[10px] uppercase text-[var(--text-secondary)] opacity-50">
+                      <span>Model</span>
+                      <span className="text-right">Instances</span>
+                      <span className="text-right">Util</span>
+                      <span className="text-right">TPS</span>
+                      <span className="text-right">TTFT</span>
+                      <span />
+                    </div>
+                    {filteredModels.map((m, i) => {
+                      const active = i === highlightedModelIndex;
+                      const selected = m === model;
+                      return (
+                        <button
+                          key={m}
+                          id={`model-option-${i}`}
+                          role="option"
+                          aria-selected={selected}
+                          onMouseEnter={() => setHighlightedModelIndex(i)}
+                          onMouseDown={(e) => e.preventDefault()}
+                          onClick={() => selectModel(m)}
+                          className={`grid min-w-[760px] w-full grid-cols-[minmax(22rem,1fr)_7rem_6rem_6rem_7rem_1.5rem] items-center gap-4 px-3 py-2 text-left text-sm transition-colors ${
+                            active ? 'bg-[var(--bg-tertiary)]' : ''
+                          } ${selected ? 'text-[var(--accent)]' : 'text-[var(--text-secondary)]'}`}
+                        >
+                          <span className="whitespace-normal break-words">{m}</span>
+                          <ModelStatsColumns stats={modelStats[m]} />
+                          <span className="flex justify-end">
+                            {selected && <Check className="w-3.5 h-3.5 shrink-0" />}
+                          </span>
+                        </button>
+                      );
+                    })}
+                  </>
                 ) : (
                   <div className="px-3 py-2 text-sm text-[var(--text-secondary)] opacity-70">
                     No matching models
@@ -1219,6 +1229,38 @@ function formatUtilization(value?: number) {
   return `${Math.round(value * 100)}% Util`;
 }
 
+function formatModelMetrics(stats?: ChutesModelStats) {
+  if (!stats) {
+    return {
+      instances: null,
+      utilization: null,
+      tps: null,
+      ttft: null,
+    };
+  }
+
+  return {
+    instances: Number.isFinite(stats.activeInstanceCount)
+      ? `${stats.activeInstanceCount} ${stats.activeInstanceCount === 1 ? 'instance' : 'instances'}`
+      : null,
+    utilization: formatUtilization(stats.utilizationCurrent),
+    tps: formatStatsNumber(stats.averageTps),
+    ttft: formatStatsNumber(stats.averageTtft, { suffix: 's' }),
+  };
+}
+
+function ModelStatsColumns({ stats }: { stats?: ChutesModelStats }) {
+  const metrics = formatModelMetrics(stats);
+  return (
+    <>
+      <span className="whitespace-nowrap text-right text-[var(--text-secondary)] opacity-75">{metrics.instances || 'n/a'}</span>
+      <span className="whitespace-nowrap text-right text-[var(--text-secondary)] opacity-75">{metrics.utilization || 'n/a'}</span>
+      <span className="whitespace-nowrap text-right text-[var(--text-secondary)] opacity-75">{metrics.tps ? `${metrics.tps} TPS` : 'n/a'}</span>
+      <span className="whitespace-nowrap text-right text-[var(--text-secondary)] opacity-75">{metrics.ttft ? `${metrics.ttft} TTFT` : 'n/a'}</span>
+    </>
+  );
+}
+
 function ModelStatsLine({
   stats,
   loading = false,
@@ -1240,12 +1282,7 @@ function ModelStatsLine({
     return null;
   }
 
-  const instances = Number.isFinite(stats.activeInstanceCount)
-    ? `${stats.activeInstanceCount} ${stats.activeInstanceCount === 1 ? 'instance' : 'instances'}`
-    : null;
-  const utilization = formatUtilization(stats.utilizationCurrent);
-  const tps = formatStatsNumber(stats.averageTps);
-  const ttft = formatStatsNumber(stats.averageTtft, { suffix: 's' });
+  const { instances, utilization, tps, ttft } = formatModelMetrics(stats);
   const parts = [
     instances,
     utilization,
