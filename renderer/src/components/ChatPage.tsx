@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useRef, useEffect, useCallback } from 'react';
+import { useState, useRef, useEffect, useCallback, useMemo } from 'react';
 import {
   Send,
   Square,
@@ -85,6 +85,8 @@ export default function ChatPage() {
   const [modelStatsLoading, setModelStatsLoading] = useState(false);
   const [modelStatsError, setModelStatsError] = useState('');
   const [showModelMenu, setShowModelMenu] = useState(false);
+  const [modelQuery, setModelQuery] = useState('');
+  const [highlightedModelIndex, setHighlightedModelIndex] = useState(0);
   const [showSettings, setShowSettings] = useState(false);
   const [apiKey, setApiKey] = useState('');
   const [apiKeySaved, setApiKeySaved] = useState(false);
@@ -97,6 +99,7 @@ export default function ChatPage() {
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  const modelInputRef = useRef<HTMLInputElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
   const settingsRef = useRef<HTMLDivElement>(null);
   const requestIdRef = useRef<string | null>(null);
@@ -118,6 +121,14 @@ export default function ChatPage() {
       }
     }
   }, []);
+
+  const selectModel = useCallback((nextModel: string) => {
+    setModel(nextModel);
+    setModelQuery('');
+    setHighlightedModelIndex(0);
+    setShowModelMenu(false);
+    modelInputRef.current?.blur();
+  }, [setModel]);
 
   const applyApiKeyStatus = useCallback((res: any) => {
     if (!res.ok) {
@@ -208,14 +219,86 @@ export default function ChatPage() {
   /* ── Close menus on outside click ───────────────────────────────────────── */
   useEffect(() => {
     function handleClick(e: MouseEvent) {
-      if (menuRef.current && !menuRef.current.contains(e.target as Node))
+      if (menuRef.current && !menuRef.current.contains(e.target as Node)) {
         setShowModelMenu(false);
+        setModelQuery('');
+        setHighlightedModelIndex(0);
+      }
       if (settingsRef.current && !settingsRef.current.contains(e.target as Node))
         setShowSettings(false);
     }
     document.addEventListener('mousedown', handleClick);
     return () => document.removeEventListener('mousedown', handleClick);
   }, []);
+
+  const filteredModels = useMemo(() => {
+    const query = modelQuery.trim().toLowerCase();
+    if (!query) return models;
+    const terms = query.split(/\s+/).filter(Boolean);
+    return models.filter((m) => {
+      const lower = m.toLowerCase();
+      return terms.every((term) => lower.includes(term));
+    });
+  }, [modelQuery, models]);
+
+  useEffect(() => {
+    setHighlightedModelIndex((idx) => {
+      if (filteredModels.length === 0) return 0;
+      return Math.min(idx, filteredModels.length - 1);
+    });
+  }, [filteredModels.length]);
+
+  const openModelMenu = useCallback(() => {
+    const currentIndex = filteredModels.indexOf(model);
+    setHighlightedModelIndex(currentIndex >= 0 ? currentIndex : 0);
+    setShowModelMenu(true);
+  }, [filteredModels, model]);
+
+  const handleModelKeyDown = useCallback((e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      setShowModelMenu(true);
+      setHighlightedModelIndex((idx) => {
+        if (filteredModels.length === 0) return 0;
+        return (idx + 1) % filteredModels.length;
+      });
+      return;
+    }
+
+    if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      setShowModelMenu(true);
+      setHighlightedModelIndex((idx) => {
+        if (filteredModels.length === 0) return 0;
+        return (idx - 1 + filteredModels.length) % filteredModels.length;
+      });
+      return;
+    }
+
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      const nextModel = filteredModels[highlightedModelIndex] || filteredModels[0];
+      if (nextModel) {
+        selectModel(nextModel);
+      }
+      return;
+    }
+
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      setShowModelMenu(false);
+      setModelQuery('');
+      setHighlightedModelIndex(0);
+      modelInputRef.current?.blur();
+    }
+  }, [filteredModels, highlightedModelIndex, selectModel]);
+
+  useEffect(() => {
+    if (!showModelMenu || filteredModels.length === 0) return;
+    document
+      .getElementById(`model-option-${highlightedModelIndex}`)
+      ?.scrollIntoView({ block: 'nearest' });
+  }, [filteredModels.length, highlightedModelIndex, showModelMenu]);
 
   /* ── Auto-resize textarea ───────────────────────────────────────────────── */
   useEffect(() => {
@@ -814,40 +897,92 @@ export default function ChatPage() {
         <div className="flex items-center gap-2">
           {/* Model picker */}
           <div className="relative" ref={menuRef}>
-            <button
-              onClick={() => setShowModelMenu(!showModelMenu)}
-              className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-[var(--bg-tertiary)] text-sm text-[var(--text-secondary)] hover:text-[var(--text-primary)] transition-colors"
+            <div
+              role="combobox"
+              aria-expanded={showModelMenu}
+              aria-controls="model-options"
+              aria-haspopup="listbox"
+              aria-activedescendant={showModelMenu && filteredModels.length > 0 ? `model-option-${highlightedModelIndex}` : undefined}
+              className="flex h-9 w-[420px] max-w-[48vw] items-center gap-2 rounded-lg bg-[var(--bg-tertiary)] px-3 text-sm text-[var(--text-secondary)] transition-colors focus-within:ring-1 focus-within:ring-[var(--accent)] hover:text-[var(--text-primary)]"
+              onMouseDown={(e) => {
+                if (e.target === e.currentTarget) {
+                  e.preventDefault();
+                  modelInputRef.current?.focus();
+                  openModelMenu();
+                }
+              }}
             >
               <Sparkles className="w-3.5 h-3.5" />
-              <span className="flex min-w-0 flex-col items-start">
-                <span className="max-w-[200px] truncate">{model}</span>
-                <ModelStatsLine
-                  stats={selectedModelStats}
-                  loading={modelStatsLoading && !selectedModelStats}
-                  error={modelStatsError}
-                />
-              </span>
-              <ChevronDown className="w-3.5 h-3.5" />
-            </button>
+              <input
+                ref={modelInputRef}
+                value={showModelMenu ? modelQuery : model}
+                onFocus={openModelMenu}
+                onChange={(e) => {
+                  setModelQuery(e.target.value);
+                  setHighlightedModelIndex(0);
+                  setShowModelMenu(true);
+                }}
+                onKeyDown={handleModelKeyDown}
+                aria-autocomplete="list"
+                className="min-w-0 flex-1 bg-transparent text-sm text-[var(--text-primary)] outline-none placeholder-[var(--text-secondary)]"
+                placeholder="Search models"
+                spellCheck={false}
+              />
+              <ModelStatsLine
+                stats={selectedModelStats}
+                loading={modelStatsLoading && !selectedModelStats}
+                error={modelStatsError}
+                className="hidden shrink-0 sm:inline"
+              />
+              <button
+                type="button"
+                onClick={() => {
+                  modelInputRef.current?.focus();
+                  if (showModelMenu) {
+                    setShowModelMenu(false);
+                    setModelQuery('');
+                  } else {
+                    openModelMenu();
+                  }
+                }}
+                className="shrink-0 text-[var(--text-secondary)] hover:text-[var(--text-primary)]"
+                tabIndex={-1}
+              >
+                <ChevronDown className="w-3.5 h-3.5" />
+              </button>
+            </div>
             {showModelMenu && (
-              <div className="absolute right-0 top-full mt-1 w-80 rounded-lg bg-[var(--bg-secondary)] border border-[var(--border)] shadow-xl z-50 py-1 max-h-80 overflow-auto">
-                {models.map((m) => (
-                  <button
-                    key={m}
-                    onClick={() => { setModel(m); setShowModelMenu(false); }}
-                    className={`w-full text-left px-3 py-2 text-sm hover:bg-[var(--bg-tertiary)] transition-colors ${
-                      m === model ? 'text-[var(--accent)]' : 'text-[var(--text-secondary)]'
-                    }`}
-                  >
-                    <span className="flex items-center justify-between gap-3">
-                      <span className="min-w-0">
-                        <span className="block truncate">{m}</span>
-                        <ModelStatsLine stats={modelStats[m]} />
-                      </span>
-                      {m === model && <Check className="w-3.5 h-3.5 shrink-0" />}
-                    </span>
-                  </button>
-                ))}
+              <div id="model-options" role="listbox" className="absolute right-0 top-full mt-1 w-[420px] max-w-[80vw] rounded-lg bg-[var(--bg-secondary)] border border-[var(--border)] shadow-xl z-50 py-1 max-h-80 overflow-auto">
+                {filteredModels.length > 0 ? (
+                  filteredModels.map((m, i) => {
+                    const active = i === highlightedModelIndex;
+                    const selected = m === model;
+                    return (
+                      <button
+                        key={m}
+                        id={`model-option-${i}`}
+                        role="option"
+                        aria-selected={selected}
+                        onMouseEnter={() => setHighlightedModelIndex(i)}
+                        onMouseDown={(e) => e.preventDefault()}
+                        onClick={() => selectModel(m)}
+                        className={`flex w-full items-center justify-between gap-3 px-3 py-2 text-left text-sm transition-colors ${
+                          active ? 'bg-[var(--bg-tertiary)]' : ''
+                        } ${selected ? 'text-[var(--accent)]' : 'text-[var(--text-secondary)]'}`}
+                      >
+                        <span className="min-w-0 flex-1 truncate">{m}</span>
+                        <span className="flex shrink-0 items-center gap-2">
+                          <ModelStatsLine stats={modelStats[m]} />
+                          {selected && <Check className="w-3.5 h-3.5 shrink-0" />}
+                        </span>
+                      </button>
+                    );
+                  })
+                ) : (
+                  <div className="px-3 py-2 text-sm text-[var(--text-secondary)] opacity-70">
+                    No matching models
+                  </div>
+                )}
               </div>
             )}
           </div>
@@ -1071,17 +1206,19 @@ function ModelStatsLine({
   stats,
   loading = false,
   error = '',
+  className = '',
 }: {
   stats?: ChutesModelStats;
   loading?: boolean;
   error?: string;
+  className?: string;
 }) {
   if (!stats) {
     if (loading) {
-      return <span className="text-[10px] leading-tight opacity-50">Loading stats...</span>;
+      return <span className={`text-[10px] leading-tight opacity-50 ${className}`}>Loading stats...</span>;
     }
     if (error) {
-      return <span className="text-[10px] leading-tight opacity-40">Stats unavailable</span>;
+      return <span className={`text-[10px] leading-tight opacity-40 ${className}`}>Stats unavailable</span>;
     }
     return null;
   }
@@ -1092,7 +1229,7 @@ function ModelStatsLine({
 
   return (
     <span
-      className="text-[10px] leading-tight text-[var(--text-secondary)] opacity-70"
+      className={`text-[10px] leading-tight text-[var(--text-secondary)] opacity-70 ${className}`}
       title={`Daily average from ${stats.date}${stats.totalRequests ? ` across ${stats.totalRequests.toLocaleString()} requests` : ''}`}
     >
       {tps ? `${tps} TPS` : 'TPS n/a'}
