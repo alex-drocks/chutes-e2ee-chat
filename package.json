@@ -20,7 +20,8 @@
     "electron": "^41.3.0",
     "mlkem": "^2.7.0",
     "@stablelib/chacha20poly1305": "^2.0.1",
-    "dotenv": "^17.4.2"
+    "dotenv": "^17.4.2",
+    "undici-types": "^6.21.1"
   },
   "devDependencies": {
     "concurrently": "^9.2.1",
