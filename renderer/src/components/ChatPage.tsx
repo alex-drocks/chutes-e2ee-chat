@@ -24,13 +24,17 @@ import {
   Zap,
   Brain,
   Trash2,
+  Paperclip,
+  Search,
+  FileText,
+  Image as ImageIcon,
 } from 'lucide-react';
 
 import { classifyError, buildRecoveryStrategies, friendlyErrorMessage } from '@/lib/errorRecovery';
 import { MemoryStore } from '@/lib/memoryStore';
 import { StatusTimeline, LiveStatusCard } from '@/components/StatusTimeline';
 import { MemoryNudge, MemoryRecallFencing, type NudgeAction } from '@/components/MemoryNudge';
-import type { Message, MessageStatus, RecoveryStrategy, ErrorReason } from '@/lib/types';
+import type { Message, MessageStatus, RecoveryStrategy, ErrorReason, MessageAttachment } from '@/lib/types';
 
 const DEFAULT_MODEL = 'Qwen/Qwen3-32B-TEE';
 const FALLBACK_MODELS = [
@@ -77,10 +81,13 @@ export default function ChatPage() {
     },
   ]);
   const [input, setInput] = useState('');
+  const [attachments, setAttachments] = useState<MessageAttachment[]>([]);
+  const [webSearchEnabled, setWebSearchEnabled] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [streamStage, setStreamStage] = useState<StreamStage>('idle');
   const [model, setModelState] = useState(DEFAULT_MODEL);
   const [models, setModels] = useState<string[]>(FALLBACK_MODELS);
+  const [modelMetadata, setModelMetadata] = useState<Record<string, ChutesModelMetadata>>({});
   const [modelStats, setModelStats] = useState<Record<string, ChutesModelStats>>({});
   const [modelStatsLoading, setModelStatsLoading] = useState(false);
   const [modelStatsError, setModelStatsError] = useState('');
@@ -99,6 +106,7 @@ export default function ChatPage() {
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
   const modelInputRef = useRef<HTMLInputElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
   const settingsRef = useRef<HTMLDivElement>(null);
@@ -169,6 +177,13 @@ export default function ChatPage() {
     window.chutes.models().then((res: any) => {
       if (res.ok && res.models && res.models.length > 0) {
         setModels(res.models.filter((m: string) => m.includes('TEE')));
+      }
+      if (res.ok && res.metadata) {
+        setModelMetadata(
+          Object.fromEntries(
+            res.metadata.map((entry: ChutesModelMetadata) => [entry.id, entry]),
+          ),
+        );
       }
     });
   }, []);
@@ -591,11 +606,16 @@ export default function ChatPage() {
     recoveryQueueRef.current = [];
   }
 
+  const selectedModelMeta = modelMetadata[model];
+  const selectedModelAcceptsImages = selectedModelMeta?.inputModalities?.includes('image') ?? false;
+
   /* ── Send message ───────────────────────────────────────────────────────── */
   const sendMessage = useCallback(
     async (opts?: { retry?: boolean; overrideInput?: string }) => {
-      const text = (opts?.overrideInput ?? input).trim();
-      if (!text || requestIdRef.current !== null) return;
+      const attachmentSnapshot = opts?.retry ? [] : attachments;
+      const enteredText = (opts?.overrideInput ?? input).trim();
+      const text = enteredText || (attachmentSnapshot.length > 0 ? 'Please review the attached file(s).' : '');
+      if ((!text && attachmentSnapshot.length === 0) || requestIdRef.current !== null) return;
 
       lastUserInputRef.current = text;
       memoryStoreRef.current.incrementTurnCounters();
@@ -612,9 +632,10 @@ export default function ChatPage() {
 
       if (!opts?.retry) {
         setInput('');
+        setAttachments([]);
       }
 
-      const userMsg: Message = { role: 'user', content: text };
+      const userMsg: Message = { role: 'user', content: text, attachments: attachmentSnapshot };
       const assistantMsg: Message = {
         role: 'assistant',
         content: '',
@@ -636,6 +657,24 @@ export default function ChatPage() {
 
       setIsLoading(true);
       hasContentRef.current = false;
+      let searchContext = '';
+      if (webSearchEnabled && !opts?.retry) {
+        setStreamStage('connecting');
+        setCurrentStatus({ done: false, action: 'searching', description: 'Searching the web…', timestamp: Date.now() });
+        const searchRes = await window.chutes.webSearch(text);
+        if (searchRes.ok && searchRes.results?.length) {
+          searchContext = formatSearchContext(text, searchRes.results);
+        } else if (searchRes.error) {
+          appendStatusHistory({
+            done: true,
+            action: 'searching',
+            description: `Web search unavailable: ${searchRes.error}`,
+            timestamp: Date.now(),
+            level: 'warning',
+          });
+        }
+      }
+
       setStreamStage('encrypting');
       setCurrentStatus({ done: false, action: 'encrypting', description: 'Encrypting message for TEE…', timestamp: Date.now() });
 
@@ -650,15 +689,21 @@ export default function ChatPage() {
 
       const params = {
         model,
-        messages: [...history, { role: 'user', content: text }],
+        messages: [
+          ...history,
+          {
+            role: 'user',
+            content: buildUserApiContent({
+              text,
+              attachments: attachmentSnapshot,
+              memoryContext,
+              searchContext,
+              includeImages: selectedModelAcceptsImages,
+            }),
+          },
+        ],
         stream: true,
       };
-
-      // Phase 3: Inject memory context into the user message if present
-      if (memoryContext) {
-        const lastMsg = params.messages[params.messages.length - 1];
-        lastMsg.content = `${lastMsg.content}\n\n${memoryContext}`;
-      }
 
       try {
         setStreamStage('connecting');
@@ -694,7 +739,7 @@ export default function ChatPage() {
         finalizeError(err?.message, c);
       }
     },
-    [input, messages, model, attemptRecovery],
+    [input, attachments, messages, model, attemptRecovery, webSearchEnabled, selectedModelAcceptsImages, appendStatusHistory],
   );
 
   /* ── Phase 3: Nudge computation ──────────────────────────────────────────── */
@@ -765,6 +810,49 @@ export default function ChatPage() {
         return { ...m, memoryContext: m.memoryContext.filter((mc) => mc.id !== id) };
       }),
     );
+  }, []);
+
+  const removeAttachment = useCallback((id: string) => {
+    setAttachments((prev) => prev.filter((attachment) => attachment.id !== id));
+  }, []);
+
+  const handleFiles = useCallback(async (files: FileList | null) => {
+    if (!files || files.length === 0) return;
+
+    const nextAttachments = await Promise.all(
+      Array.from(files).map(async (file): Promise<MessageAttachment> => {
+        const base = {
+          id: crypto.randomUUID(),
+          name: file.name,
+          mimeType: file.type || 'application/octet-stream',
+          size: file.size,
+        };
+
+        if (file.type.startsWith('image/')) {
+          return {
+            ...base,
+            kind: 'image',
+            dataUrl: await readFileAsDataUrl(file),
+          };
+        }
+
+        if (isTextFile(file)) {
+          const text = await readFileAsText(file);
+          return {
+            ...base,
+            kind: 'text',
+            text: text.slice(0, 120_000),
+          };
+        }
+
+        return { ...base, kind: 'unsupported' };
+      }),
+    );
+
+    setAttachments((prev) => [...prev, ...nextAttachments]);
+    if (fileInputRef.current) {
+      fileInputRef.current.value = '';
+    }
   }, []);
 
   /* ── Interrupt-and-redirect (Phase 2) ────────────────────────────────────── */
@@ -1143,7 +1231,7 @@ export default function ChatPage() {
       <div className="flex-1 overflow-y-auto px-4 py-6 space-y-4">
         {messages.map((msg, i) =>
           msg.role === 'user' ? (
-            <UserBubble key={i} content={msg.content} />
+            <UserBubble key={i} content={msg.content} attachments={msg.attachments} />
           ) : (
             <AssistantBubble
               key={i}
@@ -1175,7 +1263,51 @@ export default function ChatPage() {
 
       {/* Input */}
       <div className="px-4 py-3 border-t border-[var(--border)] bg-[var(--bg-secondary)]">
-        <div className="flex items-end gap-2 max-w-4xl mx-auto">
+        <div className="max-w-4xl mx-auto">
+          {attachments.length > 0 && (
+            <div className="mb-2 flex flex-wrap gap-2">
+              {attachments.map((attachment) => (
+                <div key={attachment.id} className="flex items-center gap-2 rounded-lg bg-[var(--bg-tertiary)] px-2.5 py-1 text-xs text-[var(--text-secondary)]">
+                  {attachment.kind === 'image' ? <ImageIcon className="w-3.5 h-3.5" /> : <FileText className="w-3.5 h-3.5" />}
+                  <span>{attachment.name}</span>
+                  {attachment.kind === 'unsupported' && <span className="text-amber-300">metadata only</span>}
+                  <button onClick={() => removeAttachment(attachment.id)} className="text-[var(--text-secondary)] hover:text-[var(--text-primary)]">
+                    <X className="w-3 h-3" />
+                  </button>
+                </div>
+              ))}
+              {attachments.some((attachment) => attachment.kind === 'image') && !selectedModelAcceptsImages && (
+                <span className="text-xs text-amber-300 self-center">Selected model does not advertise image input.</span>
+              )}
+            </div>
+          )}
+          <div className="flex items-end gap-2">
+          <input
+            ref={fileInputRef}
+            type="file"
+            multiple
+            className="hidden"
+            accept="image/*,.txt,.md,.json,.js,.jsx,.ts,.tsx,.py,.go,.rs,.java,.c,.cpp,.h,.css,.html,.pdf"
+            onChange={(e) => handleFiles(e.target.files)}
+          />
+          <button
+            onClick={() => fileInputRef.current?.click()}
+            className="p-3 rounded-xl bg-[var(--bg-tertiary)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] transition-colors shrink-0"
+            title="Attach files"
+          >
+            <Paperclip className="w-4 h-4" />
+          </button>
+          <button
+            onClick={() => setWebSearchEnabled((enabled) => !enabled)}
+            className={`p-3 rounded-xl transition-colors shrink-0 ${
+              webSearchEnabled
+                ? 'bg-[var(--accent)] text-black'
+                : 'bg-[var(--bg-tertiary)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
+            }`}
+            title="Use web search"
+          >
+            <Search className="w-4 h-4" />
+          </button>
           <textarea
             ref={inputRef}
             value={input}
@@ -1197,16 +1329,19 @@ export default function ChatPage() {
           ) : (
             <button
               onClick={() => sendMessage()}
-              disabled={!input.trim()}
+              disabled={!input.trim() && attachments.length === 0}
               className="p-3 rounded-xl bg-[var(--accent)] hover:bg-[var(--accent-hover)] text-black transition-colors disabled:opacity-40 shrink-0"
             >
               <Send className="w-4 h-4" />
             </button>
           )}
+          </div>
         </div>
         <p className="text-center text-[10px] text-[var(--text-secondary)] mt-2">
           {isLoading
             ? 'Working… click stop to interrupt and redirect'
+            : webSearchEnabled
+            ? 'Web search enabled · ML-KEM-768 · ChaCha20-Poly1305 · HKDF-SHA256 — End-to-end encrypted via Chutes.ai TEE'
             : 'ML-KEM-768 · ChaCha20-Poly1305 · HKDF-SHA256 — End-to-end encrypted via Chutes.ai TEE'}
         </p>
       </div>
@@ -1217,6 +1352,86 @@ export default function ChatPage() {
 /* ─────────────────────────────────────────────────────────────────────────── */
 /*  Sub-components                                                            */
 /* ─────────────────────────────────────────────────────────────────────────── */
+
+function readFileAsDataUrl(file: File) {
+  return new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || ''));
+    reader.onerror = () => reject(reader.error || new Error('Could not read file.'));
+    reader.readAsDataURL(file);
+  });
+}
+
+function readFileAsText(file: File) {
+  return new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || ''));
+    reader.onerror = () => reject(reader.error || new Error('Could not read file.'));
+    reader.readAsText(file);
+  });
+}
+
+function isTextFile(file: File) {
+  if (file.type.startsWith('text/')) return true;
+  return /\.(txt|md|json|ya?ml|csv|log|js|jsx|ts|tsx|py|go|rs|java|c|cc|cpp|h|hpp|css|html|xml|sh|sql)$/i.test(file.name);
+}
+
+function formatFileSize(bytes: number) {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+}
+
+function formatSearchContext(query: string, results: ChutesWebSearchResult[]) {
+  const lines = results.map((result, index) => (
+    `${index + 1}. ${result.title}\nURL: ${result.url}\n${result.snippet}`
+  ));
+  return `Web search results for "${query}":\n\n${lines.join('\n\n')}`;
+}
+
+function buildUserApiContent({
+  text,
+  attachments,
+  memoryContext,
+  searchContext,
+  includeImages,
+}: {
+  text: string;
+  attachments: MessageAttachment[];
+  memoryContext: string;
+  searchContext: string;
+  includeImages: boolean;
+}): string | ChutesMessageContentPart[] {
+  const textBlocks = [text];
+
+  for (const attachment of attachments) {
+    if (attachment.kind === 'text' && attachment.text) {
+      textBlocks.push(`Attached text file: ${attachment.name} (${formatFileSize(attachment.size)})\n\n\`\`\`\n${attachment.text}\n\`\`\``);
+    } else if (attachment.kind === 'unsupported') {
+      textBlocks.push(`Attached file metadata only: ${attachment.name} (${attachment.mimeType}, ${formatFileSize(attachment.size)}). This app does not extract this file type yet.`);
+    }
+  }
+
+  const images = attachments.filter((attachment) => attachment.kind === 'image' && attachment.dataUrl);
+  if (images.length > 0 && !includeImages) {
+    textBlocks.push(`Image attachment note: ${images.map((attachment) => attachment.name).join(', ')} not sent because the selected model does not advertise image input.`);
+  }
+  if (searchContext) textBlocks.push(searchContext);
+  if (memoryContext) textBlocks.push(memoryContext);
+
+  const textPart = textBlocks.filter(Boolean).join('\n\n');
+  if (images.length > 0 && includeImages) {
+    return [
+      { type: 'text', text: textPart },
+      ...images.map((attachment) => ({
+        type: 'image_url' as const,
+        image_url: { url: attachment.dataUrl || '' },
+      })),
+    ];
+  }
+
+  return textPart;
+}
 
 function formatStatsNumber(value: number, options: { suffix?: string } = {}) {
   if (!Number.isFinite(value) || value <= 0) return null;
@@ -1305,11 +1520,21 @@ function ModelStatsLine({
   );
 }
 
-function UserBubble({ content }: { content: string }) {
+function UserBubble({ content, attachments = [] }: { content: string; attachments?: MessageAttachment[] }) {
   return (
     <div className="flex gap-3 justify-end">
-      <div className="max-w-[80%] rounded-2xl px-4 py-2.5 text-sm leading-relaxed whitespace-pre-wrap bg-[var(--user-bubble)] text-white rounded-br-md">
-        {content}
+      <div className="max-w-[80%] rounded-2xl px-4 py-2.5 text-sm leading-relaxed bg-[var(--user-bubble)] text-white rounded-br-md">
+        {attachments.length > 0 && (
+          <div className="mb-2 flex flex-wrap gap-1.5">
+            {attachments.map((attachment) => (
+              <span key={attachment.id} className="inline-flex items-center gap-1 rounded-md bg-black/20 px-2 py-0.5 text-xs">
+                {attachment.kind === 'image' ? <ImageIcon className="w-3 h-3" /> : <FileText className="w-3 h-3" />}
+                {attachment.name}
+              </span>
+            ))}
+          </div>
+        )}
+        <div className="whitespace-pre-wrap">{content}</div>
       </div>
       <div className="w-7 h-7 rounded-lg bg-[var(--bg-tertiary)] flex items-center justify-center shrink-0 mt-1">
         <User className="w-4 h-4 text-[var(--text-secondary)]" />

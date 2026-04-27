@@ -583,6 +583,47 @@ async function fetchModelStats() {
   return mergeModelData(stats, utilization);
 }
 
+function decodeHtmlEntities(value) {
+  return String(value || '')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&#x27;/g, "'")
+    .replace(/<[^>]+>/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function normalizeDuckDuckGoUrl(value) {
+  try {
+    const decoded = decodeHtmlEntities(value);
+    const url = new URL(decoded, 'https://duckduckgo.com');
+    const uddg = url.searchParams.get('uddg');
+    return uddg ? decodeURIComponent(uddg) : decoded;
+  } catch {
+    return decodeHtmlEntities(value);
+  }
+}
+
+function parseDuckDuckGoResults(html) {
+  const results = [];
+  const resultPattern = /<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>[\s\S]*?<a[^>]+class="result__snippet"[^>]*>([\s\S]*?)<\/a>/g;
+  let match;
+
+  while ((match = resultPattern.exec(html)) !== null) {
+    const title = decodeHtmlEntities(match[2]);
+    const url = normalizeDuckDuckGoUrl(match[1]);
+    const snippet = decodeHtmlEntities(match[3]);
+    if (title && url) {
+      results.push({ title, url, snippet });
+    }
+  }
+
+  return results;
+}
+
 /** Send a chunk/error to the renderer for a given request. */
 function sendToRenderer(requestId, payload) {
   const win = streamingWindows.get(requestId);
@@ -640,8 +681,39 @@ ipcMain.handle('chutes:models', async (event) => {
   try {
     assertTrustedSender(event);
     const t = await getTransport();
-    const models = await t.getModels();
-    return { ok: true, models };
+    const metadata = await t.getModelMetadata();
+    return { ok: true, models: metadata.map((entry) => entry.id), metadata };
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+});
+
+ipcMain.handle('chutes:webSearch', async (event, { query }) => {
+  try {
+    assertTrustedSender(event);
+    const normalizedQuery = typeof query === 'string' ? query.trim() : '';
+    if (!normalizedQuery) {
+      return { ok: false, error: 'Search query is required.' };
+    }
+
+    const url = new URL('https://duckduckgo.com/html/');
+    url.searchParams.set('q', normalizedQuery);
+
+    const response = await fetch(url, {
+      signal: AbortSignal.timeout(12_000),
+      headers: {
+        accept: 'text/html',
+        'user-agent': 'ChutesE2EEChat/1.0',
+      },
+    });
+
+    if (!response.ok) {
+      return { ok: false, error: `Search failed: HTTP ${response.status}` };
+    }
+
+    const html = await response.text();
+    const results = parseDuckDuckGoResults(html).slice(0, 5);
+    return { ok: true, results };
   } catch (err) {
     return { ok: false, error: err.message };
   }

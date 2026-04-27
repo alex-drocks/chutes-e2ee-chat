@@ -3,13 +3,14 @@ declare global {
     chutes: {
       chat: (requestId: string, params: {
         model: string;
-        messages: Array<{ role: string; content: string }>;
+        messages: Array<{ role: string; content: string | ChutesMessageContentPart[] }>;
         stream?: boolean;
         max_tokens?: number;
       }) => Promise<{ ok: boolean; stream?: boolean; body?: any; error?: string }>;
       abort: (requestId: string) => void;
-      models: () => Promise<{ ok: boolean; models?: string[]; error?: string }>;
+      models: () => Promise<{ ok: boolean; models?: string[]; metadata?: ChutesModelMetadata[]; error?: string }>;
       modelStats: () => Promise<{ ok: boolean; stats?: Record<string, ChutesModelStats>; error?: string }>;
+      webSearch: (query: string) => Promise<{ ok: boolean; results?: ChutesWebSearchResult[]; error?: string }>;
       onStreamChunk: (callback: (payload: { requestId: string; data?: string; done?: boolean }) => void) => () => void;
       onStreamError: (callback: (payload: { requestId: string; error: string }) => void) => () => void;
       saveApiKey: (provider: string, apiKey: string) => Promise<ApiKeyStatusResponse>;
@@ -52,6 +53,27 @@ declare global {
     scalable?: boolean;
     scaleAllowance?: number;
   };
+
+  type ChutesModelMetadata = {
+    id: string;
+    chuteId: string;
+    inputModalities: string[];
+    outputModalities: string[];
+    supportedFeatures: string[];
+    contextLength?: number | null;
+    maxOutputLength?: number | null;
+    confidentialCompute: boolean;
+  };
+
+  type ChutesWebSearchResult = {
+    title: string;
+    url: string;
+    snippet: string;
+  };
+
+  type ChutesMessageContentPart =
+    | { type: 'text'; text: string }
+    | { type: 'image_url'; image_url: { url: string } };
 }
 
 export {};

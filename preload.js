@@ -26,6 +26,9 @@ const chutesAPI = {
   /** Get cached public LLM model stats. */
   modelStats: () => ipcRenderer.invoke('chutes:modelStats'),
 
+  /** Run a lightweight web search from the main process. */
+  webSearch: (query) => ipcRenderer.invoke('chutes:webSearch', { query }),
+
   /** Register callback for stream chunks. Returns a disposer function. */
   onStreamChunk: (callback) => on('chutes:chunk', callback),
 

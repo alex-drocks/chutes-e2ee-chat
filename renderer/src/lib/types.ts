@@ -13,9 +13,20 @@ export interface MessageMemory {
   id: string;
 }
 
+export interface MessageAttachment {
+  id: string;
+  name: string;
+  mimeType: string;
+  size: number;
+  kind: 'image' | 'text' | 'unsupported';
+  text?: string;
+  dataUrl?: string;
+}
+
 export interface Message {
   role: 'user' | 'assistant';
   content: string;
+  attachments?: MessageAttachment[];
   reasoning?: string;
   isStreaming?: boolean;
   isError?: boolean;
