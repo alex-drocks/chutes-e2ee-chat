@@ -5,7 +5,7 @@
  * No Node.js or Electron internals leak to the renderer.
  */
 
-import { contextBridge, ipcRenderer } from 'electron';
+const { contextBridge, ipcRenderer } = require('electron');
 
 function on(channel, callback) {
   const wrapped = (_event, payload) => callback(payload);

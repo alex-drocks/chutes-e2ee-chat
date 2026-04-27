@@ -11,11 +11,11 @@
   ],
   "scripts": {
     "dev:renderer": "bun run --cwd renderer dev",
-    "dev:electron": "wait-on http://localhost:3000 && ELECTRON_RENDERER_URL=http://localhost:3000 node node_modules/electron/cli.js .",
+    "dev:electron": "wait-on http://localhost:3000 && node scripts/run-electron.mjs --renderer-url=http://localhost:3000 .",
     "dev": "concurrently \"bun run dev:renderer\" \"bun run dev:electron\"",
     "build:renderer": "bun run --cwd renderer build",
     "build": "bun run build:renderer",
-    "start": "node node_modules/electron/cli.js .",
+    "start": "node scripts/run-electron.mjs .",
     "test": "bun run test:unit && bun run test:live",
     "test:ci": "node --test tests/protocol.regression.test.js tests/crypto.unit.test.js tests/retry.unit.test.js",
     "test:unit": "node --test tests/protocol.regression.test.js tests/crypto.unit.test.js tests/retry.unit.test.js",

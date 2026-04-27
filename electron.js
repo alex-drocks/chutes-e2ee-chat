@@ -6,16 +6,30 @@
  * - Handles streaming via ReadableStream pump.
  */
 
-import { app, BrowserWindow, ipcMain, safeStorage } from 'electron';
+import { createRequire } from 'node:module';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import fs from 'node:fs';
 
 import { ChutesE2EETransport } from './lib/chutes/ChutesE2EETransport.js';
 import { DEFAULT_MODELS_BASE } from './lib/chutes/constants.js';
 
+const require = createRequire(import.meta.url);
+const { app, BrowserWindow, ipcMain, net, protocol, safeStorage } = require('electron');
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rendererUrl = process.env.ELECTRON_RENDERER_URL;
+const rendererDistDir = path.join(__dirname, 'renderer', 'dist');
+
+protocol.registerSchemesAsPrivileged([
+  {
+    scheme: 'chutes',
+    privileges: {
+      standard: true,
+      secure: true,
+      supportFetchAPI: true,
+    },
+  },
+]);
 
 // ---------------------------------------------------------------------------
 // Secure credential storage
@@ -70,6 +84,50 @@ function setApiKey(apiKey) {
 // Window
 // ---------------------------------------------------------------------------
 
+function resolveRendererFile(requestUrl) {
+  const url = new URL(requestUrl);
+  const pathname = decodeURIComponent(url.pathname || '/index.html');
+  const relativePath = path.normalize(pathname).replace(/^[/\\]+/, '') || 'index.html';
+  const filePath = path.join(rendererDistDir, relativePath);
+  const relativeToDist = path.relative(rendererDistDir, filePath);
+
+  if (relativeToDist.startsWith('..') || path.isAbsolute(relativeToDist)) {
+    return null;
+  }
+
+  return filePath;
+}
+
+function registerStaticRendererProtocol() {
+  const contentSecurityPolicy = [
+    "default-src 'self'",
+    "script-src 'self' 'unsafe-inline'",
+    "style-src 'self' 'unsafe-inline'",
+    "img-src 'self' data: blob:",
+    "font-src 'self' data:",
+    "connect-src 'self' https://api.chutes.ai https://llm.chutes.ai",
+  ].join('; ');
+
+  protocol.handle('chutes', async (request) => {
+    const filePath = resolveRendererFile(request.url);
+    if (!filePath) {
+      return new Response('Not found', { status: 404 });
+    }
+
+    if (path.extname(filePath) === '.html') {
+      const html = await fs.promises.readFile(filePath);
+      return new Response(html, {
+        headers: {
+          'content-type': 'text/html; charset=utf-8',
+          'content-security-policy': contentSecurityPolicy,
+        },
+      });
+    }
+
+    return net.fetch(pathToFileURL(filePath).toString());
+  });
+}
+
 function createWindow() {
   const win = new BrowserWindow({
     width: 1200,
@@ -87,13 +145,14 @@ function createWindow() {
     win.loadURL(rendererUrl);
     win.webContents.openDevTools();
   } else {
-    win.loadFile(path.join(__dirname, 'renderer', 'dist', 'index.html'));
+    win.loadURL('chutes://renderer/index.html');
   }
 
   return win;
 }
 
 app.whenReady().then(() => {
+  registerStaticRendererProtocol();
   createWindow();
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();

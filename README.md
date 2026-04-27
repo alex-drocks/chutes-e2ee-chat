@@ -30,8 +30,12 @@ bun run dev
 
 # Build for production
 bun run build
+
+# Start the built renderer
 bun run start
 ```
+
+Use `bun run dev` for day-to-day development. `bun run start` loads the static renderer from `renderer/dist`, so run `bun run build` first when you want to smoke-test the built app.
 
 ## Authentication
 
