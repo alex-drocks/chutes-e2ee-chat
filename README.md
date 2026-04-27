@@ -39,10 +39,6 @@ Use `bun run dev` for day-to-day development. `bun run start` loads the static r
 
 ## Authentication
 
-Set your Chutes API key:
+Open Settings in the app and paste your Chutes API key. The key is saved encrypted on the user's machine and is only used by the Electron main process.
 
-```bash
-export CHUTES_API_KEY=cpk_xxx
-```
-
-Or add it to `.env`.
+For development and live transport tests only, you can set `CHUTES_API_KEY` in your shell or local `.env`. The Electron app runtime strips that environment variable and still requires users to configure the key through Settings.

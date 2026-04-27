@@ -8,6 +8,7 @@ out/
 renderer/.next/
 renderer/dist/
 renderer/out/
+renderer/next-env.d.ts
 
 # npm lockfiles are intentionally ignored; use Bun's bun.lock.
 package-lock.json

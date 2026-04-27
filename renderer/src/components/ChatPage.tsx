@@ -48,6 +48,23 @@ const SKILL_NUDGE_INTERVAL = 12;
 
 type StreamStage = 'idle' | 'encrypting' | 'connecting' | 'thinking' | 'streaming';
 
+type ApiKeyStatus = {
+  hasApiKey: boolean;
+  hasStoredKey: boolean;
+  source: 'stored' | 'none';
+  canPersist: boolean;
+  storageMode?: 'safeStorage' | 'localFileKey';
+  storageBackend?: string;
+  isOsBackedStorage?: boolean;
+};
+
+const EMPTY_API_KEY_STATUS: ApiKeyStatus = {
+  hasApiKey: false,
+  hasStoredKey: false,
+  source: 'none',
+  canPersist: true,
+};
+
 /* ─────────────────────────────────────────────────────────────────────────── */
 
 export default function ChatPage() {
@@ -67,6 +84,8 @@ export default function ChatPage() {
   const [showSettings, setShowSettings] = useState(false);
   const [apiKey, setApiKey] = useState('');
   const [apiKeySaved, setApiKeySaved] = useState(false);
+  const [apiKeyStatus, setApiKeyStatus] = useState<ApiKeyStatus>(EMPTY_API_KEY_STATUS);
+  const [apiKeyError, setApiKeyError] = useState('');
   const [requestId, setRequestId] = useState<string | null>(null);
   const [currentStatus, setCurrentStatus] = useState<MessageStatus | undefined>();
   const [nudges, setNudges] = useState<NudgeAction[]>([]);
@@ -85,6 +104,26 @@ export default function ChatPage() {
   const memoryStoreRef = useRef<MemoryStore>(new MemoryStore());
   const isRecoveringRef = useRef(false);
 
+  const applyApiKeyStatus = useCallback((res: any) => {
+    if (!res.ok) {
+      setApiKeyError(res.error || 'Could not read API key status.');
+      return;
+    }
+
+    const nextStatus: ApiKeyStatus = {
+      hasApiKey: Boolean(res.hasApiKey),
+      hasStoredKey: Boolean(res.hasStoredKey),
+      source: res.source || 'none',
+      canPersist: res.canPersist !== false,
+      storageMode: res.storageMode,
+      storageBackend: res.storageBackend,
+      isOsBackedStorage: Boolean(res.isOsBackedStorage),
+    };
+
+    setApiKeyStatus(nextStatus);
+    setApiKeySaved(nextStatus.hasApiKey);
+  }, []);
+
   /* ── Fetch available models ─────────────────────────────────────────────── */
   useEffect(() => {
     if (typeof window === 'undefined' || !window.chutes) return;
@@ -98,10 +137,8 @@ export default function ChatPage() {
   /* ── Load stored API key ────────────────────────────────────────────────── */
   useEffect(() => {
     if (typeof window === 'undefined' || !window.chutes) return;
-    window.chutes.getApiKey('chutes').then((res: any) => {
-      if (res.ok && res.apiKey) setApiKeySaved(true);
-    });
-  }, []);
+    window.chutes.getApiKeyStatus('chutes').then(applyApiKeyStatus);
+  }, [applyApiKeyStatus]);
 
   /* ── Auto-scroll ────────────────────────────────────────────────────────── */
   useEffect(() => {
@@ -641,11 +678,25 @@ export default function ChatPage() {
   /* ── Settings ───────────────────────────────────────────────────────────── */
   const saveKey = async () => {
     if (!apiKey.trim()) return;
+    setApiKeyError('');
     const res = await window.chutes.saveApiKey('chutes', apiKey.trim());
     if (res.ok) {
-      setApiKeySaved(true);
+      applyApiKeyStatus(res);
       setShowSettings(false);
       setApiKey('');
+    } else {
+      setApiKeyError(res.error || 'Could not save API key.');
+    }
+  };
+
+  const deleteKey = async () => {
+    setApiKeyError('');
+    const res = await window.chutes.deleteApiKey('chutes');
+    if (res.ok) {
+      applyApiKeyStatus(res);
+      setApiKey('');
+    } else {
+      setApiKeyError(res.error || 'Could not delete API key.');
     }
   };
 
@@ -775,11 +826,16 @@ export default function ChatPage() {
                   Chutes API Key
                 </label>
                 <p className="text-xs text-[var(--text-secondary)] mb-2">
-                  Stored encrypted at rest. Get yours at{' '}
+                  Stored encrypted on this machine and used only by the Electron main process. Get yours at{' '}
                   <a href="https://chutes.ai/app/api-keys" target="_blank" rel="noopener noreferrer" className="text-[var(--accent)] hover:underline">
                     chutes.ai/app/api-keys
                   </a>
                 </p>
+                {apiKeyStatus.canPersist && apiKeyStatus.storageMode === 'localFileKey' && (
+                  <p className="text-xs text-amber-300 mb-2">
+                    Using local encrypted storage for this WSL/Linux environment. Keep your user profile files private.
+                  </p>
+                )}
                 <input
                   type="password"
                   value={apiKey}
@@ -788,13 +844,24 @@ export default function ChatPage() {
                   className="w-full rounded-lg bg-[var(--bg-tertiary)] text-[var(--text-primary)] text-sm px-3 py-2 outline-none focus:ring-1 focus:ring-[var(--accent)] border border-[var(--border)]"
                 />
                 <button onClick={saveKey} disabled={!apiKey.trim()} className="mt-2 w-full py-2 rounded-lg bg-[var(--accent)] hover:bg-[var(--accent-hover)] text-black text-sm font-medium transition-colors disabled:opacity-40">
-                  {apiKeySaved ? 'Update API Key' : 'Save API Key'}
+                  {apiKeyStatus.hasStoredKey ? 'Update Stored API Key' : 'Save API Key'}
                 </button>
+                {apiKeyStatus.hasStoredKey && (
+                  <button onClick={deleteKey} className="mt-2 w-full py-2 rounded-lg border border-red-900/60 text-red-300 hover:bg-red-950/40 text-sm font-medium transition-colors flex items-center justify-center gap-2">
+                    <Trash2 className="w-3.5 h-3.5" />
+                    Remove Stored API Key
+                  </button>
+                )}
+                {apiKeyError && (
+                  <p className="text-xs text-red-300 mt-2">{apiKeyError}</p>
+                )}
               </div>
               {apiKeySaved && (
                 <p className="text-xs text-[var(--accent)] flex items-center gap-1">
                   <Shield className="w-3 h-3" />
-                  API key stored securely
+                  {apiKeyStatus.isOsBackedStorage
+                    ? 'API key stored with OS-backed encryption'
+                    : 'API key stored with local encrypted storage'}
                 </p>
               )}
 

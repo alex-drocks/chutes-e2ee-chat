@@ -33,8 +33,13 @@ const chutesAPI = {
   saveApiKey: (provider, apiKey) =>
     ipcRenderer.invoke('settings:saveApiKey', { provider, apiKey }),
 
-  /** Get stored API key for a provider. */
-  getApiKey: (provider) => ipcRenderer.invoke('settings:getApiKey', { provider }),
+  /** Get API key presence and storage status. Does not return the key. */
+  getApiKeyStatus: (provider) =>
+    ipcRenderer.invoke('settings:getApiKeyStatus', { provider }),
+
+  /** Delete the persisted API key for a provider. */
+  deleteApiKey: (provider) =>
+    ipcRenderer.invoke('settings:deleteApiKey', { provider }),
 };
 
 contextBridge.exposeInMainWorld('chutes', chutesAPI);

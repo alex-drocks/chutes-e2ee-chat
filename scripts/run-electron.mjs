@@ -6,6 +6,7 @@ const electronPath = require('electron');
 
 const env = { ...process.env };
 delete env.ELECTRON_RUN_AS_NODE;
+delete env.CHUTES_API_KEY;
 
 const args = [];
 for (const arg of process.argv.slice(2)) {

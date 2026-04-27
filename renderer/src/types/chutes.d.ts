@@ -11,10 +11,23 @@ declare global {
       models: () => Promise<{ ok: boolean; models?: string[]; error?: string }>;
       onStreamChunk: (callback: (payload: { requestId: string; data?: string; done?: boolean }) => void) => () => void;
       onStreamError: (callback: (payload: { requestId: string; error: string }) => void) => () => void;
-      saveApiKey: (provider: string, apiKey: string) => Promise<{ ok: boolean; error?: string }>;
-      getApiKey: (provider: string) => Promise<{ ok: boolean; apiKey?: string; error?: string }>;
+      saveApiKey: (provider: string, apiKey: string) => Promise<ApiKeyStatusResponse>;
+      getApiKeyStatus: (provider: string) => Promise<ApiKeyStatusResponse>;
+      deleteApiKey: (provider: string) => Promise<ApiKeyStatusResponse>;
     };
   }
+
+  type ApiKeyStatusResponse = {
+    ok: boolean;
+    hasApiKey?: boolean;
+    hasStoredKey?: boolean;
+    source?: 'stored' | 'none';
+    canPersist?: boolean;
+    storageMode?: 'safeStorage' | 'localFileKey';
+    storageBackend?: string;
+    isOsBackedStorage?: boolean;
+    error?: string;
+  };
 }
 
 export {};

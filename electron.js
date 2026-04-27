@@ -2,7 +2,7 @@
  * Electron Main Process
  *
  * - Runs all Chutes API calls in Node.js main to bypass CORS.
- * - Encrypts credentials with safeStorage.
+ * - Encrypts credentials with OS safeStorage or an app-local file key fallback.
  * - Handles streaming via ReadableStream pump.
  */
 
@@ -10,6 +10,7 @@ import { createRequire } from 'node:module';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import fs from 'node:fs';
+import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
 
 import { ChutesE2EETransport } from './lib/chutes/ChutesE2EETransport.js';
 import { DEFAULT_MODELS_BASE } from './lib/chutes/constants.js';
@@ -19,6 +20,9 @@ const { app, BrowserWindow, ipcMain, net, protocol, safeStorage } = require('ele
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rendererUrl = process.env.ELECTRON_RENDERER_URL;
 const rendererDistDir = path.join(__dirname, 'renderer', 'dist');
+const API_KEY_PROVIDER = 'chutes';
+const MAX_API_KEY_LENGTH = 512;
+const CREDENTIALS_AAD = Buffer.from('chutes-e2ee-chat.credentials.v2');
 
 protocol.registerSchemesAsPrivileged([
   {
@@ -36,14 +40,74 @@ protocol.registerSchemesAsPrivileged([
 // ---------------------------------------------------------------------------
 
 const CREDENTIALS_FILE = path.join(app.getPath('userData'), 'credentials.enc');
+const LOCAL_KEY_FILE = path.join(app.getPath('userData'), 'credentials.key');
+
+function getStorageBackend() {
+  if (typeof safeStorage.getSelectedStorageBackend !== 'function') {
+    return undefined;
+  }
+  try {
+    return safeStorage.getSelectedStorageBackend();
+  } catch {
+    return undefined;
+  }
+}
+
+function canUseSafeStorage() {
+  const backend = getStorageBackend();
+  return safeStorage.isEncryptionAvailable() && backend !== 'basic_text';
+}
+
+function getCredentialStorageMode() {
+  return canUseSafeStorage() ? 'safeStorage' : 'localFileKey';
+}
+
+function assertSupportedProvider(provider) {
+  if (provider !== API_KEY_PROVIDER) {
+    throw new Error('Unsupported provider. Use "chutes".');
+  }
+}
+
+function isTrustedRendererUrl(value) {
+  try {
+    const url = new URL(value);
+    if (rendererUrl) {
+      return url.origin === new URL(rendererUrl).origin;
+    }
+    return url.protocol === 'chutes:' && url.hostname === 'renderer';
+  } catch {
+    return false;
+  }
+}
+
+function assertTrustedSender(event) {
+  const senderUrl = event.senderFrame?.url || event.sender.getURL();
+  if (!isTrustedRendererUrl(senderUrl)) {
+    throw new Error('Untrusted renderer origin.');
+  }
+}
+
+function normalizeApiKey(apiKey) {
+  if (typeof apiKey !== 'string') {
+    throw new Error('API key must be a string.');
+  }
+
+  const trimmed = apiKey.trim();
+  if (!trimmed) {
+    throw new Error('API key is required.');
+  }
+
+  if (trimmed.length > MAX_API_KEY_LENGTH) {
+    throw new Error('API key is too long.');
+  }
+
+  return trimmed;
+}
 
 async function loadCredentials() {
   try {
-    const encrypted = await fs.promises.readFile(CREDENTIALS_FILE);
-    if (safeStorage.isEncryptionAvailable()) {
-      return JSON.parse(safeStorage.decryptString(encrypted));
-    }
-    return JSON.parse(encrypted.toString('utf-8'));
+    const stored = await fs.promises.readFile(CREDENTIALS_FILE);
+    return await decryptCredentials(stored);
   } catch {
     return {};
   }
@@ -51,10 +115,124 @@ async function loadCredentials() {
 
 async function saveCredentials(creds) {
   const payload = JSON.stringify(creds);
-  const encrypted = safeStorage.isEncryptionAvailable()
-    ? safeStorage.encryptString(payload)
-    : Buffer.from(payload);
-  await fs.promises.writeFile(CREDENTIALS_FILE, encrypted);
+  const encrypted = await encryptCredentials(payload);
+  await fs.promises.mkdir(path.dirname(CREDENTIALS_FILE), { recursive: true });
+  await fs.promises.writeFile(CREDENTIALS_FILE, encrypted, { mode: 0o600 });
+  await fs.promises.chmod(CREDENTIALS_FILE, 0o600).catch(() => {});
+}
+
+async function encryptCredentials(payload) {
+  if (canUseSafeStorage()) {
+    return Buffer.from(JSON.stringify({
+      version: 2,
+      mode: 'safeStorage',
+      backend: getStorageBackend(),
+      ciphertext: safeStorage.encryptString(payload).toString('base64'),
+    }));
+  }
+
+  const key = await getLocalEncryptionKey({ create: true });
+  const iv = randomBytes(12);
+  const cipher = createCipheriv('aes-256-gcm', key, iv);
+  cipher.setAAD(CREDENTIALS_AAD);
+  const ciphertext = Buffer.concat([cipher.update(payload, 'utf8'), cipher.final()]);
+  const tag = cipher.getAuthTag();
+
+  return Buffer.from(JSON.stringify({
+    version: 2,
+    mode: 'localFileKey',
+    alg: 'aes-256-gcm',
+    iv: iv.toString('base64'),
+    tag: tag.toString('base64'),
+    ciphertext: ciphertext.toString('base64'),
+  }));
+}
+
+async function decryptCredentials(stored) {
+  const text = stored.toString('utf8');
+  let envelope;
+
+  try {
+    envelope = JSON.parse(text);
+  } catch {
+    if (!canUseSafeStorage()) return {};
+    return JSON.parse(safeStorage.decryptString(stored));
+  }
+
+  if (envelope?.version === 2 && envelope.mode === 'safeStorage') {
+    if (!canUseSafeStorage()) return {};
+    return JSON.parse(safeStorage.decryptString(Buffer.from(envelope.ciphertext, 'base64')));
+  }
+
+  if (envelope?.version === 2 && envelope.mode === 'localFileKey') {
+    return JSON.parse(await decryptWithLocalKey(envelope));
+  }
+
+  if (envelope?.chutesApiKey) {
+    await saveCredentials(envelope);
+    return envelope;
+  }
+
+  return {};
+}
+
+async function getLocalEncryptionKey({ create }) {
+  try {
+    const encoded = (await fs.promises.readFile(LOCAL_KEY_FILE, 'utf8')).trim();
+    const key = Buffer.from(encoded, 'base64');
+    if (key.length === 32) return key;
+  } catch {
+    // Create a new local key below only when saving.
+  }
+
+  if (!create) {
+    throw new Error('Local credential key is missing or invalid.');
+  }
+
+  const key = randomBytes(32);
+  await fs.promises.mkdir(path.dirname(LOCAL_KEY_FILE), { recursive: true });
+  await fs.promises.writeFile(LOCAL_KEY_FILE, key.toString('base64'), { mode: 0o600 });
+  await fs.promises.chmod(LOCAL_KEY_FILE, 0o600).catch(() => {});
+  return key;
+}
+
+async function decryptWithLocalKey(envelope) {
+  const key = await getLocalEncryptionKey({ create: false });
+  const decipher = createDecipheriv(
+    'aes-256-gcm',
+    key,
+    Buffer.from(envelope.iv, 'base64'),
+  );
+  decipher.setAAD(CREDENTIALS_AAD);
+  decipher.setAuthTag(Buffer.from(envelope.tag, 'base64'));
+  return Buffer.concat([
+    decipher.update(Buffer.from(envelope.ciphertext, 'base64')),
+    decipher.final(),
+  ]).toString('utf8');
+}
+
+async function deleteCredentialsFileIfEmpty(creds) {
+  if (Object.keys(creds).length === 0) {
+    await fs.promises.rm(CREDENTIALS_FILE, { force: true });
+    await fs.promises.rm(LOCAL_KEY_FILE, { force: true });
+    return true;
+  }
+  return false;
+}
+
+async function getApiKeyStatus() {
+  const creds = await loadCredentials();
+  const hasStoredKey = Boolean(creds.chutesApiKey);
+
+  return {
+    hasApiKey: hasStoredKey,
+    hasStoredKey,
+    source: hasStoredKey ? 'stored' : 'none',
+    canPersist: true,
+    storageMode: getCredentialStorageMode(),
+    storageBackend: getStorageBackend(),
+    isOsBackedStorage: canUseSafeStorage(),
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -67,7 +245,7 @@ async function getTransport() {
   if (transport) return transport;
 
   const creds = await loadCredentials();
-  const apiKey = process.env.CHUTES_API_KEY || creds.chutesApiKey || '';
+  const apiKey = creds.chutesApiKey || '';
   transport = new ChutesE2EETransport({ apiKey, modelsBase: DEFAULT_MODELS_BASE });
   return transport;
 }
@@ -246,10 +424,11 @@ function cleanupRequest(requestId) {
 }
 
 ipcMain.handle('chutes:chat', async (event, { requestId, params }) => {
-  const win = BrowserWindow.fromWebContents(event.sender);
-  streamingWindows.set(requestId, win);
-
   try {
+    assertTrustedSender(event);
+    const win = BrowserWindow.fromWebContents(event.sender);
+    streamingWindows.set(requestId, win);
+
     const t = await getTransport();
     const { response, abort } = await t.chat(params);
     activeControllers.set(requestId, abort);
@@ -268,13 +447,19 @@ ipcMain.handle('chutes:chat', async (event, { requestId, params }) => {
   }
 });
 
-ipcMain.handle('chutes:abort', (_event, { requestId }) => {
-  activeControllers.get(requestId)?.();
-  cleanupRequest(requestId);
+ipcMain.handle('chutes:abort', (event, { requestId }) => {
+  try {
+    assertTrustedSender(event);
+    activeControllers.get(requestId)?.();
+    cleanupRequest(requestId);
+  } catch {
+    return;
+  }
 });
 
-ipcMain.handle('chutes:models', async () => {
+ipcMain.handle('chutes:models', async (event) => {
   try {
+    assertTrustedSender(event);
     const t = await getTransport();
     const models = await t.getModels();
     return { ok: true, models };
@@ -283,28 +468,44 @@ ipcMain.handle('chutes:models', async () => {
   }
 });
 
-ipcMain.handle('settings:saveApiKey', async (_event, { provider, apiKey }) => {
+ipcMain.handle('settings:saveApiKey', async (event, { provider, apiKey }) => {
   try {
-    if (provider !== 'chutes') {
-      return { ok: false, error: 'Unsupported provider. Use "chutes".' };
-    }
+    assertTrustedSender(event);
+    assertSupportedProvider(provider);
+    const normalizedApiKey = normalizeApiKey(apiKey);
     const creds = await loadCredentials();
-    creds.chutesApiKey = apiKey;
+    creds.chutesApiKey = normalizedApiKey;
     await saveCredentials(creds);
-    setApiKey(apiKey);
-    return { ok: true };
+    setApiKey(normalizedApiKey);
+    return { ok: true, ...(await getApiKeyStatus()) };
   } catch (err) {
     return { ok: false, error: err.message };
   }
 });
 
-ipcMain.handle('settings:getApiKey', async (_event, { provider }) => {
+ipcMain.handle('settings:getApiKeyStatus', async (event, { provider }) => {
   try {
-    if (provider !== 'chutes') {
-      return { ok: false, error: 'Unsupported provider. Use "chutes".' };
-    }
+    assertTrustedSender(event);
+    assertSupportedProvider(provider);
+    return { ok: true, ...(await getApiKeyStatus()) };
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+});
+
+ipcMain.handle('settings:deleteApiKey', async (event, { provider }) => {
+  try {
+    assertTrustedSender(event);
+    assertSupportedProvider(provider);
     const creds = await loadCredentials();
-    return { ok: true, apiKey: creds.chutesApiKey || '' };
+    delete creds.chutesApiKey;
+
+    if (!(await deleteCredentialsFileIfEmpty(creds))) {
+      await saveCredentials(creds);
+    }
+
+    setApiKey('');
+    return { ok: true, ...(await getApiKeyStatus()) };
   } catch (err) {
     return { ok: false, error: err.message };
   }
