@@ -1,6 +1,8 @@
 'use client';
 
 import { useState, useRef, useEffect, useCallback, useMemo } from 'react';
+import { useChat } from '@ai-sdk/react';
+import { lastAssistantMessageIsCompleteWithToolCalls, type FileUIPart } from 'ai';
 import {
   Send,
   Square,
@@ -30,11 +32,11 @@ import {
   Image as ImageIcon,
 } from 'lucide-react';
 
-import { classifyError, buildRecoveryStrategies, friendlyErrorMessage } from '@/lib/errorRecovery';
 import { MemoryStore } from '@/lib/memoryStore';
 import { StatusTimeline, LiveStatusCard } from '@/components/StatusTimeline';
 import { MemoryNudge, MemoryRecallFencing, type NudgeAction } from '@/components/MemoryNudge';
-import type { Message, MessageStatus, RecoveryStrategy, ErrorReason, MessageAttachment } from '@/lib/types';
+import { ChutesChatTransport, type ChutesUIMessage } from '@/lib/ai/chutesTransport';
+import type { Message, MessageStatus, MessageAttachment } from '@/lib/types';
 
 const DEFAULT_MODEL = 'Qwen/Qwen3-32B-TEE';
 const FALLBACK_MODELS = [
@@ -46,7 +48,6 @@ const FALLBACK_MODELS = [
 ];
 
 const MODEL_STORAGE_KEY = 'chutes-e2ee-chat.lastModel';
-const MAX_AUTO_RECOVERY = 3;
 const MAX_RETRIES = 2; // manual retry button limit
 const MEMORY_NUDGE_INTERVAL = 8;
 const SKILL_NUDGE_INTERVAL = 12;
@@ -63,30 +64,6 @@ type ApiKeyStatus = {
   isOsBackedStorage?: boolean;
 };
 
-type ChatApiMessage = {
-  role: string;
-  content?: string | ChutesMessageContentPart[] | null;
-  tool_calls?: ChutesToolCall[];
-  tool_call_id?: string;
-  name?: string;
-};
-
-type ActiveToolContext = {
-  model: string;
-  messages: ChatApiMessage[];
-  toolsEnabled: boolean;
-  toolDepth: number;
-};
-
-type PendingToolCall = {
-  id: string;
-  type: 'function';
-  function: {
-    name: string;
-    arguments: string;
-  };
-};
-
 const EMPTY_API_KEY_STATUS: ApiKeyStatus = {
   hasApiKey: false,
   hasStoredKey: false,
@@ -94,16 +71,16 @@ const EMPTY_API_KEY_STATUS: ApiKeyStatus = {
   canPersist: true,
 };
 
+const WELCOME_MESSAGE: Message = {
+  role: 'assistant',
+  content:
+    'Welcome to Chutes E2EE Chat. Your messages are encrypted end-to-end using ML-KEM-768 + ChaCha20-Poly1305. Only the TEE GPU instance can decrypt your prompts.\n\nI learn from every conversation — click the brain icon to see what I remember. I also handle hiccups automatically (rate limits, timeouts) so we never lose momentum.',
+};
+
 /* ─────────────────────────────────────────────────────────────────────────── */
 
 export default function ChatPage() {
-  const [messages, setMessages] = useState<Message[]>([
-    {
-      role: 'assistant',
-      content:
-        'Welcome to Chutes E2EE Chat. Your messages are encrypted end-to-end using ML-KEM-768 + ChaCha20-Poly1305. Only the TEE GPU instance can decrypt your prompts.\n\nI learn from every conversation — click the brain icon to see what I remember. I also handle hiccups automatically (rate limits, timeouts) so we never lose momentum.',
-    },
-  ]);
+  const [messages, setMessages] = useState<Message[]>([WELCOME_MESSAGE]);
   const [input, setInput] = useState('');
   const [attachments, setAttachments] = useState<MessageAttachment[]>([]);
   const [webSearchEnabled, setWebSearchEnabled] = useState(false);
@@ -123,7 +100,6 @@ export default function ChatPage() {
   const [apiKeySaved, setApiKeySaved] = useState(false);
   const [apiKeyStatus, setApiKeyStatus] = useState<ApiKeyStatus>(EMPTY_API_KEY_STATUS);
   const [apiKeyError, setApiKeyError] = useState('');
-  const [requestId, setRequestId] = useState<string | null>(null);
   const [currentStatus, setCurrentStatus] = useState<MessageStatus | undefined>();
   const [nudges, setNudges] = useState<NudgeAction[]>([]);
   const [showMemoryPanel, setShowMemoryPanel] = useState(false);
@@ -134,19 +110,68 @@ export default function ChatPage() {
   const modelInputRef = useRef<HTMLInputElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
   const settingsRef = useRef<HTMLDivElement>(null);
-  const requestIdRef = useRef<string | null>(null);
-  const hasContentRef = useRef(false);
   const retryCountRef = useRef(0);
-  const recoveryAttemptsRef = useRef(0);
-  const recoveryQueueRef = useRef<RecoveryStrategy[]>([]);
-  const lastUserInputRef = useRef('');
   const memoryStoreRef = useRef<MemoryStore>(new MemoryStore());
-  const isRecoveringRef = useRef(false);
-  const activeToolContextRef = useRef<ActiveToolContext | null>(null);
-  const pendingToolCallsRef = useRef<Map<number, PendingToolCall>>(new Map());
-  const textToolBufferRef = useRef('');
-  const assistantToolContentRef = useRef<string | null>(null);
-  const currentAssistantContentRef = useRef('');
+  const addToolOutputRef = useRef<any>(null);
+
+  const selectedModelMeta = modelMetadata[model];
+  const selectedModelAcceptsImages = selectedModelMeta?.inputModalities?.includes('image') ?? false;
+  const chatTransport = useMemo(() => new ChutesChatTransport(), []);
+  const {
+    messages: aiMessages,
+    sendMessage: sendAiMessage,
+    regenerate: regenerateAiMessage,
+    stop: stopAiMessage,
+    status: aiStatus,
+    error: aiError,
+    addToolOutput,
+  } = useChat<ChutesUIMessage>({
+    transport: chatTransport,
+    sendAutomaticallyWhen: lastAssistantMessageIsCompleteWithToolCalls,
+    async onToolCall({ toolCall }) {
+      if (toolCall.dynamic || toolCall.toolName !== 'web_search') return;
+
+      const input = toolCall.input as { query?: string };
+      const query = typeof input?.query === 'string' ? input.query.trim() : '';
+      if (!query) {
+        addToolOutputRef.current?.({
+          tool: 'web_search',
+          toolCallId: toolCall.toolCallId,
+          state: 'output-error',
+          errorText: 'web_search requires a non-empty query string.',
+          options: { body: { model, toolsEnabled: webSearchEnabled, includeImages: selectedModelAcceptsImages } },
+        });
+        return;
+      }
+
+      const result = await window.chutes.webSearch(query);
+      addToolOutputRef.current?.({
+        tool: 'web_search',
+        toolCallId: toolCall.toolCallId,
+        ...(result.ok
+          ? {
+              output: {
+                ok: true,
+                tool: 'web_search',
+                query,
+                source: 'live_web_search',
+                provider: result.provider || 'web search',
+                fetchedAt: result.fetchedAt || new Date().toISOString(),
+                results: result.results || [],
+              },
+            }
+          : {
+              state: 'output-error',
+              errorText: result.error || 'Web search failed.',
+            }),
+        options: { body: { model, toolsEnabled: webSearchEnabled, includeImages: selectedModelAcceptsImages } },
+      });
+    },
+  });
+
+  useEffect(() => {
+    addToolOutputRef.current = addToolOutput;
+  }, [addToolOutput]);
 
   const setModel = useCallback((nextModel: string) => {
     setModelState(nextModel);
@@ -269,6 +294,35 @@ export default function ChatPage() {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages, currentStatus, nudges]);
 
+  useEffect(() => {
+    setMessages([
+      WELCOME_MESSAGE,
+      ...aiMessages.map((message, index) =>
+        uiMessageToDisplayMessage(message, {
+          isLast: index === aiMessages.length - 1,
+          status: aiStatus,
+          error: aiError,
+        }),
+      ),
+    ]);
+  }, [aiMessages, aiStatus, aiError]);
+
+  useEffect(() => {
+    const loading = aiStatus === 'submitted' || aiStatus === 'streaming';
+    setIsLoading(loading);
+
+    if (aiStatus === 'submitted') {
+      setStreamStage('connecting');
+      setCurrentStatus({ done: false, action: 'connecting', description: 'Connecting to Chutes TEE…', timestamp: Date.now() });
+    } else if (aiStatus === 'streaming') {
+      setStreamStage('streaming');
+      setCurrentStatus({ done: false, action: 'streaming', description: 'Streaming response…', timestamp: Date.now() });
+    } else {
+      setStreamStage('idle');
+      setCurrentStatus(undefined);
+    }
+  }, [aiStatus]);
+
   /* ── Close menus on outside click ───────────────────────────────────────── */
   useEffect(() => {
     function handleClick(e: MouseEvent) {
@@ -361,449 +415,16 @@ export default function ChatPage() {
     el.style.height = `${Math.min(el.scrollHeight, 128)}px`;
   }, [input]);
 
-  async function continueAfterToolCalls() {
-    const context = activeToolContextRef.current;
-    if (!context || !context.toolsEnabled) return false;
-
-    const pendingToolCalls = Array.from(pendingToolCallsRef.current.values())
-      .filter((toolCall) => toolCall.id && toolCall.function.name)
-      .map((toolCall) => ({
-        ...toolCall,
-        function: {
-          ...toolCall.function,
-          name: normalizeToolName(toolCall.function.name),
-        },
-      }));
-    pendingToolCallsRef.current = new Map();
-
-    if (pendingToolCalls.length === 0) return false;
-
-    if (context.toolDepth >= 3) {
-      finalizeError('Tool call limit reached before the model produced a final answer.');
-      return true;
-    }
-
-    appendStatusHistory({
-      done: false,
-      action: 'tool_call',
-      description: pendingToolCalls.length === 1
-        ? `Calling ${pendingToolCalls[0].function.name}…`
-        : `Calling ${pendingToolCalls.length} tools…`,
-      timestamp: Date.now(),
-    });
-    setStreamStage('connecting');
-    setCurrentStatus({ done: false, action: 'tool_call', description: 'Running model-requested tool…', timestamp: Date.now() });
-
-    const toolMessages: ChatApiMessage[] = [];
-    for (const toolCall of pendingToolCalls) {
-      const result = await executeToolCall(toolCall);
-      toolMessages.push({
-        role: 'tool',
-        tool_call_id: toolCall.id,
-        name: normalizeToolName(toolCall.function.name),
-        content: JSON.stringify(result),
-      });
-    }
-
-    appendStatusHistory({
-      done: true,
-      action: 'tool_result',
-      description: 'Tool result returned to model',
-      timestamp: Date.now(),
-      level: 'success',
-    });
-
-    const nextMessages: ChatApiMessage[] = [
-      ...context.messages,
-      { role: 'assistant', content: assistantToolContentRef.current || null, tool_calls: pendingToolCalls },
-      ...toolMessages,
-    ];
-    const nextContext = {
-      ...context,
-      messages: nextMessages,
-      toolDepth: context.toolDepth + 1,
-    };
-    activeToolContextRef.current = nextContext;
-    assistantToolContentRef.current = null;
-
-    const id = crypto.randomUUID();
-    setRequestId(id);
-    requestIdRef.current = id;
-    hasContentRef.current = false;
-    setStreamStage('encrypting');
-    setCurrentStatus({ done: false, action: 'encrypting', description: 'Encrypting tool results for TEE…', timestamp: Date.now() });
-
-    try {
-      setStreamStage('connecting');
-      setCurrentStatus({ done: false, action: 'connecting', description: 'Continuing with tool results…', timestamp: Date.now() });
-      const res = await window.chutes.chat(id, {
-        model: nextContext.model,
-        messages: nextMessages,
-        stream: true,
-        tools: buildStandardTools(),
-        tool_choice: 'auto',
-      });
-      if (!res.ok) {
-        finalizeError(res.error);
-        return true;
-      }
-      setCurrentStatus({ done: false, action: 'thinking', description: 'Waiting for response…', timestamp: Date.now() });
-    } catch (err: any) {
-      finalizeError(err?.message);
-    }
-
-    return true;
-  }
-
-  function bufferTextToolContent(content: string) {
-    if (!content) return '';
-
-    const marker = '<|tool_calls_section_begin|>';
-    if (textToolBufferRef.current) {
-      textToolBufferRef.current += content;
-      return '';
-    }
-
-    const markerIndex = content.indexOf(marker);
-    if (markerIndex === -1) return content;
-
-    textToolBufferRef.current = content.slice(markerIndex);
-    return content.slice(0, markerIndex);
-  }
-
-  function getLastAssistantContent() {
-    const content = currentAssistantContentRef.current.trim();
-    return content ? content : null;
-  }
-
-  /* ── Register stream listeners ──────────────────────────────────────────── */
-  useEffect(() => {
-    if (typeof window === 'undefined' || !window.chutes) return;
-
-    const disposeChunk = window.chutes.onStreamChunk((payload: any) => {
-      if (requestIdRef.current && payload.requestId !== requestIdRef.current) return;
-
-      if (payload.done) {
-        const textToolCalls = extractTextToolCalls(textToolBufferRef.current);
-        if (textToolCalls.toolCalls.length > 0) {
-          queuePendingToolCalls(textToolCalls.toolCalls, pendingToolCallsRef.current);
-          assistantToolContentRef.current = getLastAssistantContent();
-          textToolBufferRef.current = '';
-        }
-
-        if (pendingToolCallsRef.current.size > 0) {
-          void continueAfterToolCalls().then((handled) => {
-            if (!handled) {
-              finalizeError('The model requested a tool, but no active tool context was available.');
-            }
-          });
-          return;
-        }
-
-        setIsLoading(false);
-        setStreamStage('idle');
-        setCurrentStatus(undefined);
-
-        setMessages((prev) => {
-          const last = prev[prev.length - 1];
-          const isEmpty = last?.role === 'assistant' && !last.content && !last.reasoning;
-          const next = prev.map((m, i) =>
-            i === prev.length - 1
-              ? {
-                  ...m,
-                  isStreaming: false,
-                  done: true,
-                  isEmpty: isEmpty && !hasContentRef.current ? true : m.isEmpty,
-                }
-              : m,
-          );
-          return next;
-        });
-
-        if (isRecoveringRef.current) {
-          isRecoveringRef.current = false;
-          recoveryAttemptsRef.current = 0;
-          recoveryQueueRef.current = [];
-        }
-
-        // Trigger nudges after turn completes
-        computeNudges();
-
-        setRequestId(null);
-        requestIdRef.current = null;
-        activeToolContextRef.current = null;
-        pendingToolCallsRef.current = new Map();
-        textToolBufferRef.current = '';
-        assistantToolContentRef.current = null;
-        currentAssistantContentRef.current = '';
-        retryCountRef.current = 0;
-        return;
-      }
-
-      if (!payload.data) return;
-      if (payload.data === '[DONE]') return;
-
-      try {
-        const parsed = JSON.parse(payload.data);
-        const delta = parsed.choices?.[0]?.delta;
-
-        if (delta) {
-          const content = delta.content || '';
-          const reasoning = delta.reasoning_content || delta.reasoning || '';
-          const toolCalls = delta.tool_calls || [];
-          const visibleContent = bufferTextToolContent(content);
-
-          if (content || reasoning || toolCalls.length > 0) {
-            hasContentRef.current = true;
-          }
-
-          if (toolCalls.length > 0) {
-            accumulateToolCallDeltas(toolCalls, pendingToolCallsRef.current);
-            setStreamStage('thinking');
-            setCurrentStatus({ done: false, action: 'tool_call', description: 'Model is preparing a tool call…', timestamp: Date.now() });
-          }
-
-          if (reasoning && !content) {
-            setStreamStage('thinking');
-            setCurrentStatus({ done: false, action: 'thinking', description: 'Streaming model reasoning…', timestamp: Date.now() });
-          } else if (visibleContent) {
-            setStreamStage('streaming');
-            setCurrentStatus({ done: false, action: 'streaming', description: 'Streaming response…', timestamp: Date.now() });
-          }
-
-          if (visibleContent) {
-            currentAssistantContentRef.current += visibleContent;
-          }
-
-          setMessages((prev) => {
-            const last = prev[prev.length - 1];
-            if (last.role !== 'assistant' || !last.isStreaming) return prev;
-            return [
-              ...prev.slice(0, -1),
-              {
-                ...last,
-                content: last.content + visibleContent,
-                reasoning: last.reasoning
-                  ? last.reasoning + reasoning
-                  : reasoning || undefined,
-              },
-            ];
-          });
-        }
-      } catch {
-        hasContentRef.current = true;
-        setStreamStage('streaming');
-      }
-    });
-
-    const disposeError = window.chutes.onStreamError((payload: any) => {
-      if (requestIdRef.current && payload.requestId !== requestIdRef.current) return;
-
-      const classified = classifyError(payload.error || '');
-      appendStatusHistory({
-        done: true,
-        action: 'error',
-        description: classified.message,
-        timestamp: Date.now(),
-        level: 'error',
-      });
-
-      // Phase 1: Try auto-recovery before showing error
-      if (classified.retryable && recoveryAttemptsRef.current < MAX_AUTO_RECOVERY) {
-        const strategies = buildRecoveryStrategies(classified, FALLBACK_MODELS, model);
-        if (strategies.length > 0) {
-          recoveryQueueRef.current = strategies;
-          isRecoveringRef.current = true;
-          attemptRecovery();
-          return; // Don't show error yet — try recovery first
-        }
-      }
-
-      // Recovery exhausted or not retryable — surface to user
-      finalizeError(payload.error, classified);
-    });
-
-    return () => {
-      disposeChunk();
-      disposeError();
-    };
-  }, [model]);
-
-  /* ── Append a status entry to the last assistant message ──────────────────── */
-  const appendStatusHistory = useCallback((status: MessageStatus) => {
-    setMessages((prev) => {
-      const last = prev[prev.length - 1];
-      if (last?.role !== 'assistant') return prev;
-      const history = last.statusHistory || [];
-      return [
-        ...prev.slice(0, -1),
-        { ...last, statusHistory: [...history, status] },
-      ];
-    });
-  }, []);
-
-  /* ── Auto-recovery engine (Phase 1) ──────────────────────────────────────── */
-  const attemptRecovery = useCallback(
-    async (forceInput?: string) => {
-      if (recoveryQueueRef.current.length === 0) {
-        isRecoveringRef.current = false;
-        return;
-      }
-      const strategy = recoveryQueueRef.current.shift()!;
-      recoveryAttemptsRef.current += 1;
-
-      appendStatusHistory({
-        done: false,
-        action: strategy.strategy,
-        description:
-          strategy.strategy === 'wait_retry'
-            ? `Waiting ${strategy.delayMs / 1000}s before retry with ${strategy.model}`
-            : strategy.strategy === 'truncate_retry'
-            ? 'Trimming conversation history and retrying'
-            : `Switching to fallback model: ${strategy.model}`,
-        timestamp: Date.now(),
-        level: 'warning',
-      });
-
-      // Wait
-      await new Promise((r) => setTimeout(r, strategy.delayMs));
-
-      // Apply strategy
-      if (strategy.strategy === 'fallback_model') {
-        setModel(strategy.model);
-      }
-
-      const userText = forceInput ?? lastUserInputRef.current;
-      if (!userText) {
-        finalizeError('No user input to recover with');
-        return;
-      }
-
-      // Reset streaming state for the retry
-      setMessages((prev) =>
-        prev.map((m, i) =>
-          i === prev.length - 1 && m.role === 'assistant'
-            ? {
-                role: 'assistant',
-                content: '',
-                isStreaming: true,
-                reasoning: undefined,
-                statusHistory: m.statusHistory,
-                recoveredFromError: true,
-                modelUsed: strategy.model,
-              }
-            : m,
-        ),
-      );
-
-      setIsLoading(true);
-      hasContentRef.current = false;
-      setStreamStage('encrypting');
-
-      const id = crypto.randomUUID();
-      setRequestId(id);
-      requestIdRef.current = id;
-
-      // Build history (optionally truncated for context_overflow)
-      let history = messages
-        .filter((m) => !m.isStreaming && !m.isError && !m.isEmpty)
-        .map((m) => ({ role: m.role, content: m.content }));
-
-      if (strategy.truncateContext) {
-        // Keep first 2 system+welcome + last 6 exchanges + current user
-        history = history.slice(0, 3).concat(history.slice(-6));
-      }
-
-      const params = {
-        model: strategy.model,
-        messages: [...history, { role: 'user', content: userText }],
-        stream: true,
-      };
-
-      try {
-        setStreamStage('connecting');
-        const res = await window.chutes.chat(id, params);
-        if (!res.ok) {
-          // This retry also failed — try next strategy
-          const nextClassified = classifyError(res.error || 'Request failed');
-          if (nextClassified.retryable && recoveryQueueRef.current.length > 0 && recoveryAttemptsRef.current < MAX_AUTO_RECOVERY) {
-            attemptRecovery(userText);
-            return;
-          }
-          finalizeError(res.error, nextClassified);
-        }
-      } catch (err: any) {
-        const nextClassified = classifyError(err?.message || 'Unexpected error');
-        if (nextClassified.retryable && recoveryQueueRef.current.length > 0 && recoveryAttemptsRef.current < MAX_AUTO_RECOVERY) {
-          attemptRecovery(userText);
-          return;
-        }
-        finalizeError(err?.message, nextClassified);
-      }
-    },
-    [messages, model, appendStatusHistory],
-  );
-
-  function finalizeError(rawError?: string, classified?: ReturnType<typeof classifyError>) {
-    const c = classified ?? classifyError(rawError || '');
-    setIsLoading(false);
-    setStreamStage('idle');
-    setCurrentStatus(undefined);
-    hasContentRef.current = false;
-    isRecoveringRef.current = false;
-
-    appendStatusHistory({
-      done: true,
-      action: 'error',
-      description: c.message,
-      timestamp: Date.now(),
-      level: 'error',
-    });
-
-    setMessages((prev) => {
-      const last = prev[prev.length - 1];
-      if (last?.role === 'assistant' && last.isStreaming) {
-        return [
-          ...prev.slice(0, -1),
-          {
-            ...last,
-            content: friendlyErrorMessage(c, rawError),
-            isError: true,
-            isStreaming: false,
-            done: true,
-            modelUsed: model,
-          },
-        ];
-      }
-      return prev;
-    });
-
-    setRequestId(null);
-    requestIdRef.current = null;
-    activeToolContextRef.current = null;
-    pendingToolCallsRef.current = new Map();
-    textToolBufferRef.current = '';
-    assistantToolContentRef.current = null;
-    currentAssistantContentRef.current = '';
-    recoveryAttemptsRef.current = 0;
-    recoveryQueueRef.current = [];
-  }
-
-  const selectedModelMeta = modelMetadata[model];
-  const selectedModelAcceptsImages = selectedModelMeta?.inputModalities?.includes('image') ?? false;
-
   /* ── Send message ───────────────────────────────────────────────────────── */
   const sendMessage = useCallback(
     async (opts?: { retry?: boolean; overrideInput?: string }) => {
       const attachmentSnapshot = opts?.retry ? [] : attachments;
       const enteredText = (opts?.overrideInput ?? input).trim();
       const text = enteredText || (attachmentSnapshot.length > 0 ? 'Please review the attached file(s).' : '');
-      if ((!text && attachmentSnapshot.length === 0) || requestIdRef.current !== null) return;
+      if ((!text && attachmentSnapshot.length === 0) || aiStatus === 'submitted' || aiStatus === 'streaming') return;
 
-      lastUserInputRef.current = text;
       memoryStoreRef.current.incrementTurnCounters();
 
-      // Phase 3: Prefetch memory and build context
       const memoryContext = memoryStoreRef.current.getMemoryContextBlock();
       const messagesWithMemory = memoryStoreRef.current.getMemories();
       const memoryForUI: Message['memoryContext'] = messagesWithMemory.map((m) => ({
@@ -818,109 +439,35 @@ export default function ChatPage() {
         setAttachments([]);
       }
 
-      const userMsg: Message = { role: 'user', content: text, attachments: attachmentSnapshot };
-      const assistantMsg: Message = {
-        role: 'assistant',
-        content: '',
-        isStreaming: true,
-        memoryContext: memoryForUI,
-      };
-
-      if (!opts?.retry) {
-        setMessages((prev) => [...prev, userMsg, assistantMsg]);
-      } else {
-        setMessages((prev) =>
-          prev.map((m, i) =>
-            i === prev.length - 1 && m.role === 'assistant'
-              ? { ...assistantMsg, statusHistory: m.statusHistory }
-              : m,
-          ),
-        );
-      }
-
-      setIsLoading(true);
-      hasContentRef.current = false;
-      pendingToolCallsRef.current = new Map();
-      textToolBufferRef.current = '';
-      assistantToolContentRef.current = null;
-      currentAssistantContentRef.current = '';
-
       setStreamStage('encrypting');
       setCurrentStatus({ done: false, action: 'encrypting', description: 'Encrypting message for TEE…', timestamp: Date.now() });
 
-      const id = crypto.randomUUID();
-      setRequestId(id);
-      requestIdRef.current = id;
-
-      // Prepare conversation history
-      let history = messages
-        .filter((m) => !m.isStreaming && !m.isError && !m.isEmpty)
-        .map((m) => ({ role: m.role, content: m.content } as ChatApiMessage));
-
-      const requestMessages: ChatApiMessage[] = [
-        ...buildToolSystemMessages(webSearchEnabled),
-        ...history,
-        {
-          role: 'user',
-          content: buildUserApiContent({
-            text,
-            attachments: attachmentSnapshot,
-            memoryContext,
-            searchContext: '',
-            includeImages: selectedModelAcceptsImages,
-          }),
-        },
-      ];
-
-      activeToolContextRef.current = {
-        model,
-        messages: requestMessages,
-        toolsEnabled: webSearchEnabled,
-        toolDepth: 0,
-      };
-
-      const params = {
-        model,
-        messages: requestMessages,
-        stream: true,
-        ...(webSearchEnabled ? { tools: buildStandardTools(), tool_choice: 'auto' } : {}),
-      };
-
       try {
-        setStreamStage('connecting');
-        setCurrentStatus({ done: false, action: 'connecting', description: 'Connecting to Chutes TEE…', timestamp: Date.now() });
-        const res = await window.chutes.chat(id, params);
-        if (!res.ok) {
-          // Pre-flight error — classify and attempt recovery
-          const c = classifyError(res.error || '');
-          if (c.retryable && recoveryAttemptsRef.current < MAX_AUTO_RECOVERY) {
-            const strategies = buildRecoveryStrategies(c, FALLBACK_MODELS, model);
-            if (strategies.length > 0) {
-              recoveryQueueRef.current = strategies;
-              isRecoveringRef.current = true;
-              await attemptRecovery(text);
-              return;
-            }
-          }
-          finalizeError(res.error, c);
-        } else {
-          setCurrentStatus({ done: false, action: 'thinking', description: 'Waiting for response…', timestamp: Date.now() });
-        }
+        await sendAiMessage(
+          {
+            parts: [
+              { type: 'text', text },
+              ...attachmentsToFileParts(attachmentSnapshot),
+            ],
+            metadata: {
+              attachments: attachmentSnapshot,
+              memoryContext: memoryForUI,
+              memoryContextText: memoryContext,
+            },
+          },
+          {
+            body: {
+              model,
+              toolsEnabled: webSearchEnabled,
+              includeImages: selectedModelAcceptsImages,
+            },
+          },
+        );
       } catch (err: any) {
-        const c = classifyError(err?.message || 'Unexpected error');
-        if (c.retryable && recoveryAttemptsRef.current < MAX_AUTO_RECOVERY) {
-          const strategies = buildRecoveryStrategies(c, FALLBACK_MODELS, model);
-          if (strategies.length > 0) {
-            recoveryQueueRef.current = strategies;
-            isRecoveringRef.current = true;
-            await attemptRecovery(text);
-            return;
-          }
-        }
-        finalizeError(err?.message, c);
+        setCurrentStatus({ done: true, action: 'error', description: err?.message || 'Unexpected error', timestamp: Date.now(), level: 'error' });
       }
     },
-    [input, attachments, messages, model, attemptRecovery, webSearchEnabled, selectedModelAcceptsImages, appendStatusHistory],
+    [input, attachments, aiStatus, sendAiMessage, model, webSearchEnabled, selectedModelAcceptsImages],
   );
 
   /* ── Phase 3: Nudge computation ──────────────────────────────────────────── */
@@ -951,6 +498,12 @@ export default function ChatPage() {
 
     setNudges(newNudges);
   }, []);
+
+  useEffect(() => {
+    if (aiStatus === 'ready' && aiMessages.length > 0) {
+      computeNudges();
+    }
+  }, [aiStatus, aiMessages.length, computeNudges]);
 
   const handleNudgeAction = useCallback(
     (nudge: NudgeAction, choice: string) => {
@@ -1038,28 +591,14 @@ export default function ChatPage() {
 
   /* ── Interrupt-and-redirect (Phase 2) ────────────────────────────────────── */
   const abort = useCallback(() => {
-    if (requestIdRef.current) {
-      window.chutes.abort(requestIdRef.current);
-      setIsLoading(false);
-      setStreamStage('idle');
-      setCurrentStatus(undefined);
-      hasContentRef.current = false;
-      recoveryQueueRef.current = [];
-      isRecoveringRef.current = false;
-      setRequestId(null);
-      requestIdRef.current = null;
-      setMessages((prev) =>
-        prev.map((m, i) =>
-          i === prev.length - 1 && m.isStreaming ? { ...m, isStreaming: false, done: true } : m,
-        ),
-      );
-    }
-  }, []);
+    stopAiMessage();
+    setIsLoading(false);
+    setStreamStage('idle');
+    setCurrentStatus(undefined);
+  }, [stopAiMessage]);
 
   /* ── Retry / Regenerate helpers ─────────────────────────────────────────── */
   const retryLastMessage = useCallback(() => {
-    const lastUserMsg = [...messages].reverse().find((m) => m.role === 'user');
-    if (!lastUserMsg) return;
     retryCountRef.current += 1;
     if (retryCountRef.current > MAX_RETRIES) {
       setMessages((prev) =>
@@ -1075,27 +614,29 @@ export default function ChatPage() {
       );
       return;
     }
-    sendMessage({ retry: true, overrideInput: lastUserMsg.content });
-  }, [messages, sendMessage]);
+    regenerateAiMessage({
+      body: {
+        model,
+        toolsEnabled: webSearchEnabled,
+        includeImages: selectedModelAcceptsImages,
+      },
+    });
+  }, [regenerateAiMessage, model, webSearchEnabled, selectedModelAcceptsImages]);
 
   const regenerateMessage = useCallback(
     (assistantIdx: number) => {
-      let userIdx = -1;
-      for (let i = assistantIdx - 1; i >= 0; i--) {
-        if (messages[i].role === 'user') {
-          userIdx = i;
-          break;
-        }
-      }
-      if (userIdx === -1) return;
-      const trimmed = messages.slice(0, assistantIdx);
-      setMessages([...trimmed, { role: 'assistant', content: '', isStreaming: true }]);
+      const messageId = messages[assistantIdx]?.id;
       retryCountRef.current = 0;
-      setTimeout(() => {
-        sendMessage({ retry: true, overrideInput: messages[userIdx].content });
-      }, 0);
+      regenerateAiMessage({
+        messageId,
+        body: {
+          model,
+          toolsEnabled: webSearchEnabled,
+          includeImages: selectedModelAcceptsImages,
+        },
+      });
     },
-    [messages, sendMessage],
+    [messages, regenerateAiMessage, model, webSearchEnabled, selectedModelAcceptsImages],
   );
 
   /* ── Settings ───────────────────────────────────────────────────────────── */
@@ -1534,6 +1075,73 @@ export default function ChatPage() {
 /*  Sub-components                                                            */
 /* ─────────────────────────────────────────────────────────────────────────── */
 
+function attachmentsToFileParts(attachments: MessageAttachment[]): FileUIPart[] {
+  return attachments
+    .filter((attachment) => attachment.kind === 'image' && attachment.dataUrl)
+    .map((attachment) => ({
+      type: 'file' as const,
+      mediaType: attachment.mimeType || 'image/png',
+      filename: attachment.name,
+      url: attachment.dataUrl || '',
+    }));
+}
+
+function uiMessageToDisplayMessage(
+  message: ChutesUIMessage,
+  {
+    isLast,
+    status,
+    error,
+  }: {
+    isLast: boolean;
+    status: string;
+    error?: Error;
+  },
+): Message {
+  const text = message.parts
+    .filter((part) => part.type === 'text')
+    .map((part) => part.text)
+    .join('');
+  const reasoning = message.parts
+    .filter((part) => part.type === 'reasoning')
+    .map((part) => part.text)
+    .join('');
+  const toolStatuses = message.parts
+    .filter((part) => part.type === 'dynamic-tool' || part.type.startsWith('tool-'))
+    .map((part: any): MessageStatus => ({
+      done: part.state === 'output-available' || part.state === 'output-error' || part.state === 'output-denied',
+      action: part.state?.startsWith('output') ? 'tool_result' : 'tool_call',
+      description:
+        part.state === 'output-error'
+          ? `${toolDisplayName(part)} failed: ${part.errorText || 'Unknown error'}`
+          : part.state?.startsWith('output')
+          ? `${toolDisplayName(part)} returned a result`
+          : `Calling ${toolDisplayName(part)}…`,
+      timestamp: Date.now(),
+      level: part.state === 'output-error' ? 'error' : part.state?.startsWith('output') ? 'success' : 'info',
+    }));
+
+  const isLoading = isLast && (status === 'submitted' || status === 'streaming');
+  const isError = isLast && status === 'error' && message.role === 'assistant';
+
+  return {
+    id: message.id,
+    role: message.role === 'assistant' ? 'assistant' : 'user',
+    content: isError && !text ? (error?.message || 'Something went wrong.') : text,
+    reasoning: reasoning || undefined,
+    attachments: message.metadata?.attachments,
+    memoryContext: message.metadata?.memoryContext,
+    statusHistory: toolStatuses.length > 0 ? toolStatuses : undefined,
+    isStreaming: message.role === 'assistant' && isLoading,
+    isError,
+    done: message.role === 'assistant' ? !isLoading : undefined,
+  };
+}
+
+function toolDisplayName(part: any) {
+  return String(part.type === 'dynamic-tool' ? part.toolName : part.type.replace(/^tool-/, ''));
+}
+
 function readFileAsDataUrl(file: File) {
   return new Promise<string>((resolve, reject) => {
     const reader = new FileReader();
@@ -1561,205 +1169,6 @@ function formatFileSize(bytes: number) {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
-}
-
-function buildToolSystemMessages(toolsEnabled: boolean): ChatApiMessage[] {
-  if (!toolsEnabled) return [];
-  return [
-    {
-      role: 'system',
-      content:
-        `Current date: ${new Date().toISOString()}.\n` +
-        'You have access to standard function tools. Use web_search when live, recent, source-backed, or changing information is needed. ' +
-        'Tool results are fetched by the app from the live web and returned as role:tool messages; they are not a simulated search transcript. ' +
-        'Use the returned URLs/snippets when relevant and cite sources in plain text.',
-    },
-  ];
-}
-
-function buildStandardTools(): ChutesToolDefinition[] {
-  return [
-    {
-      type: 'function',
-      function: {
-        name: 'web_search',
-        description:
-          'Search the live web for current or source-backed information. Returns titles, URLs, and snippets.',
-        parameters: {
-          type: 'object',
-          properties: {
-            query: {
-              type: 'string',
-              description: 'The web search query to run.',
-            },
-          },
-          required: ['query'],
-          additionalProperties: false,
-        },
-      },
-    },
-  ];
-}
-
-function accumulateToolCallDeltas(toolCalls: any[], pending: Map<number, PendingToolCall>) {
-  for (const delta of toolCalls) {
-    const index = Number.isInteger(delta.index) ? delta.index : 0;
-    const current = pending.get(index) || {
-      id: '',
-      type: 'function' as const,
-      function: { name: '', arguments: '' },
-    };
-
-    if (delta.id) current.id = delta.id;
-    if (delta.type) current.type = delta.type;
-    if (delta.function?.name) {
-      const namePart = String(delta.function.name);
-      current.function.name = current.function.name.endsWith(namePart)
-        ? current.function.name
-        : current.function.name + namePart;
-    }
-    if (delta.function?.arguments) {
-      current.function.arguments += delta.function.arguments;
-    }
-
-    pending.set(index, current);
-  }
-}
-
-function extractTextToolCalls(content: string) {
-  const toolCalls: PendingToolCall[] = [];
-  if (!content.includes('<|tool_calls_section_begin|>')) {
-    return { cleanContent: content, toolCalls };
-  }
-
-  let callIndex = 0;
-  const sectionPattern = /<\|tool_calls_section_begin\|>[\s\S]*?<\|tool_calls_section_end\|>/g;
-  const cleanContent = content.replace(sectionPattern, '').trimEnd();
-  for (const sectionMatch of content.matchAll(sectionPattern)) {
-    const section = sectionMatch[0];
-    const callPattern = /<\|tool_call_begin\|>\s*([^\s<]+?)(?::\d+)?\s*<\|tool_call_argument_begin\|>\s*([\s\S]*?)\s*<\|tool_call_end\|>/g;
-    for (const callMatch of section.matchAll(callPattern)) {
-      toolCalls.push({
-        id: `text-tool-${Date.now()}-${callIndex}`,
-        type: 'function',
-        function: {
-          name: normalizeToolName(callMatch[1]),
-          arguments: callMatch[2].trim(),
-        },
-      });
-      callIndex += 1;
-    }
-  }
-
-  return { cleanContent, toolCalls };
-}
-
-function queuePendingToolCalls(toolCalls: PendingToolCall[], pending: Map<number, PendingToolCall>) {
-  const startIndex = pending.size;
-  toolCalls.forEach((toolCall, offset) => {
-    pending.set(startIndex + offset, toolCall);
-  });
-}
-
-function normalizeToolName(name: string) {
-  return name.replace(/^functions\./, '').replace(/:\d+$/, '').trim();
-}
-
-async function executeToolCall(toolCall: PendingToolCall) {
-  const name = normalizeToolName(toolCall.function.name);
-  if (name !== 'web_search') {
-    return {
-      ok: false,
-      tool: name,
-      error: `Unsupported tool: ${name}`,
-    };
-  }
-
-  let args: { query?: string } = {};
-  try {
-    args = JSON.parse(toolCall.function.arguments || '{}');
-  } catch {
-    return {
-      ok: false,
-      tool: name,
-      error: 'Tool arguments were not valid JSON.',
-      rawArguments: toolCall.function.arguments,
-    };
-  }
-
-  const query = typeof args.query === 'string' ? args.query.trim() : '';
-  if (!query) {
-    return {
-      ok: false,
-      tool: name,
-      error: 'web_search requires a non-empty query string.',
-    };
-  }
-
-  const result = await window.chutes.webSearch(query);
-  if (!result.ok) {
-    return {
-      ok: false,
-      tool: name,
-      query,
-      error: result.error || 'Web search failed.',
-      fetchedAt: new Date().toISOString(),
-    };
-  }
-
-  return {
-    ok: true,
-    tool: name,
-    query,
-    source: 'live_web_search',
-    provider: result.provider || 'web search',
-    fetchedAt: result.fetchedAt || new Date().toISOString(),
-    results: result.results || [],
-  };
-}
-
-function buildUserApiContent({
-  text,
-  attachments,
-  memoryContext,
-  searchContext,
-  includeImages,
-}: {
-  text: string;
-  attachments: MessageAttachment[];
-  memoryContext: string;
-  searchContext: string;
-  includeImages: boolean;
-}): string | ChutesMessageContentPart[] {
-  const textBlocks = [text];
-
-  for (const attachment of attachments) {
-    if (attachment.kind === 'text' && attachment.text) {
-      textBlocks.push(`Attached text file: ${attachment.name} (${formatFileSize(attachment.size)})\n\n\`\`\`\n${attachment.text}\n\`\`\``);
-    } else if (attachment.kind === 'unsupported') {
-      textBlocks.push(`Attached file metadata only: ${attachment.name} (${attachment.mimeType}, ${formatFileSize(attachment.size)}). This app does not extract this file type yet.`);
-    }
-  }
-
-  const images = attachments.filter((attachment) => attachment.kind === 'image' && attachment.dataUrl);
-  if (images.length > 0 && !includeImages) {
-    textBlocks.push(`Image attachment note: ${images.map((attachment) => attachment.name).join(', ')} not sent because the selected model does not advertise image input.`);
-  }
-  if (searchContext) textBlocks.push(searchContext);
-  if (memoryContext) textBlocks.push(memoryContext);
-
-  const textPart = textBlocks.filter(Boolean).join('\n\n');
-  if (images.length > 0 && includeImages) {
-    return [
-      { type: 'text', text: textPart },
-      ...images.map((attachment) => ({
-        type: 'image_url' as const,
-        image_url: { url: attachment.dataUrl || '' },
-      })),
-    ];
-  }
-
-  return textPart;
 }
 
 function formatStatsNumber(value: number, options: { suffix?: string } = {}) {

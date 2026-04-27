@@ -24,6 +24,7 @@ export interface MessageAttachment {
 }
 
 export interface Message {
+  id?: string;
   role: 'user' | 'assistant';
   content: string;
   attachments?: MessageAttachment[];
