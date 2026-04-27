@@ -1,13 +1,18 @@
 # Dependencies
-package-lock.json
-renderer/package-lock.json
+node_modules/
 
 # Build outputs
-node_modules/
 dist/
 .next/
 out/
+renderer/.next/
+renderer/dist/
 renderer/out/
+
+# npm lockfiles are intentionally ignored; use Bun's bun.lock.
+package-lock.json
+renderer/package-lock.json
+npm-shrinkwrap.json
 
 # Secrets
 .env
@@ -16,3 +21,4 @@ renderer/out/
 # Logs / OS
 *.log
 .DS_Store
+.codex

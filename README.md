@@ -12,7 +12,7 @@ An Electron.js + Next.js + Tailwind chat application using Chutes.ai's end-to-en
 
 The app implements the full Chutes.ai E2EE protocol:
 
-- **ML-KEM-768** (FIPS 203) post-quantum key encapsulation via `npm:mlkem`
+- **ML-KEM-768** (FIPS 203) post-quantum key encapsulation via `mlkem`
 - **HKDF-SHA256** key derivation via `node:crypto`
 - **ChaCha20-Poly1305** authenticated encryption via `@stablelib/chacha20poly1305`
 - **Gzip** compression via `node:zlib`
@@ -23,14 +23,14 @@ All encrypted requests route through `/e2e/invoke` so only the specific TEE GPU 
 
 ```bash
 # Install dependencies
-npm install
+bun install
 
 # Development (starts Next.js dev server + Electron)
-npm run dev
+bun run dev
 
 # Build for production
-npm run build
-npm start
+bun run build
+bun run start
 ```
 
 ## Authentication

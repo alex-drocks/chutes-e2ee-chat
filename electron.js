@@ -15,7 +15,7 @@ import { ChutesE2EETransport } from './lib/chutes/ChutesE2EETransport.js';
 import { DEFAULT_MODELS_BASE } from './lib/chutes/constants.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const isDev = !app.isPackaged;
+const rendererUrl = process.env.ELECTRON_RENDERER_URL;
 
 // ---------------------------------------------------------------------------
 // Secure credential storage
@@ -83,8 +83,8 @@ function createWindow() {
     titleBarStyle: 'hiddenInset',
   });
 
-  if (isDev) {
-    win.loadURL('http://localhost:3000');
+  if (rendererUrl) {
+    win.loadURL(rendererUrl);
     win.webContents.openDevTools();
   } else {
     win.loadFile(path.join(__dirname, 'renderer', 'dist', 'index.html'));

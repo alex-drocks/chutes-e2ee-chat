@@ -1,22 +1,29 @@
 {
   "name": "chutes-e2ee-chat",
   "version": "0.1.0",
+  "private": true,
   "description": "Electron + Next.js + Tailwind chat app with Chutes.ai E2EE",
   "main": "electron.js",
   "type": "module",
+  "packageManager": "bun@1.3.13",
+  "workspaces": [
+    "renderer"
+  ],
   "scripts": {
-    "dev:renderer": "cd renderer && next dev -p 3000",
-    "dev:electron": "wait-on http://localhost:3000 && electron .",
-    "dev": "concurrently \"npm run dev:renderer\" \"npm run dev:electron\"",
-    "build:renderer": "cd renderer && next build",
-    "build": "npm run build:renderer",
-    "start": "electron .",
-    "postinstall": "cd renderer && npm install",
-    "test": "npm run test:unit && npm run test:live",
+    "dev:renderer": "bun run --cwd renderer dev",
+    "dev:electron": "wait-on http://localhost:3000 && ELECTRON_RENDERER_URL=http://localhost:3000 node node_modules/electron/cli.js .",
+    "dev": "concurrently \"bun run dev:renderer\" \"bun run dev:electron\"",
+    "build:renderer": "bun run --cwd renderer build",
+    "build": "bun run build:renderer",
+    "start": "node node_modules/electron/cli.js .",
+    "test": "bun run test:unit && bun run test:live",
     "test:ci": "node --test tests/protocol.regression.test.js tests/crypto.unit.test.js tests/retry.unit.test.js",
     "test:unit": "node --test tests/protocol.regression.test.js tests/crypto.unit.test.js tests/retry.unit.test.js",
     "test:live": "node --test tests/e2ee-integration.test.js tests/cors-free.test.js tests/e2ee-comprehensive.test.js tests/e2ee-stress.test.js"
   },
+  "trustedDependencies": [
+    "electron"
+  ],
   "dependencies": {
     "electron": "^41.3.0",
     "mlkem": "^2.7.0",
