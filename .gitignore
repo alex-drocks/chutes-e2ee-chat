@@ -1,10 +1,18 @@
+# Dependencies
+package-lock.json
+renderer/package-lock.json
+
+# Build outputs
 node_modules/
 dist/
 .next/
 out/
+renderer/out/
+
+# Secrets
 .env
 .env.local
+
+# Logs / OS
 *.log
 .DS_Store
-package-lock.json
-renderer/package-lock.json

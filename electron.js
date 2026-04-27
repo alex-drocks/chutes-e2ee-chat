@@ -1,25 +1,75 @@
 /**
  * Electron Main Process
  *
- * Bootstraps the Next.js renderer and handles all Chutes E2EE transport
- * via IPC, keeping crypto and auth in the secure main process.
+ * - Runs all Chutes API calls in Node.js main to bypass CORS.
+ * - Encrypts credentials with safeStorage.
+ * - Handles streaming via ReadableStream pump.
  */
 
-import { app, BrowserWindow, ipcMain } from 'electron';
+import { app, BrowserWindow, ipcMain, safeStorage } from 'electron';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import 'dotenv/config';
+import fs from 'node:fs';
 
 import { ChutesE2EETransport } from './lib/chutes/ChutesE2EETransport.js';
+import { DEFAULT_MODELS_BASE } from './lib/chutes/constants.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-
 const isDev = !app.isPackaged;
-const API_KEY = process.env.CHUTES_API_KEY || '';
 
-const chutes = new ChutesE2EETransport({ apiKey: API_KEY });
+// ---------------------------------------------------------------------------
+// Secure credential storage
+// ---------------------------------------------------------------------------
 
-/** Create the main browser window. */
+const CREDENTIALS_FILE = path.join(app.getPath('userData'), 'credentials.enc');
+
+async function loadCredentials() {
+  try {
+    const encrypted = await fs.promises.readFile(CREDENTIALS_FILE);
+    if (safeStorage.isEncryptionAvailable()) {
+      return JSON.parse(safeStorage.decryptString(encrypted));
+    }
+    return JSON.parse(encrypted.toString('utf-8'));
+  } catch {
+    return {};
+  }
+}
+
+async function saveCredentials(creds) {
+  const payload = JSON.stringify(creds);
+  const encrypted = safeStorage.isEncryptionAvailable()
+    ? safeStorage.encryptString(payload)
+    : Buffer.from(payload);
+  await fs.promises.writeFile(CREDENTIALS_FILE, encrypted);
+}
+
+// ---------------------------------------------------------------------------
+// Transport lifecycle
+// ---------------------------------------------------------------------------
+
+let transport = null;
+
+async function getTransport() {
+  if (transport) return transport;
+
+  const creds = await loadCredentials();
+  const apiKey = process.env.CHUTES_API_KEY || creds.chutesApiKey || '';
+  transport = new ChutesE2EETransport({ apiKey, modelsBase: DEFAULT_MODELS_BASE });
+  return transport;
+}
+
+function setApiKey(apiKey) {
+  if (transport) {
+    transport.setApiKey(apiKey);
+  } else {
+    transport = new ChutesE2EETransport({ apiKey, modelsBase: DEFAULT_MODELS_BASE });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Window
+// ---------------------------------------------------------------------------
+
 function createWindow() {
   const win = new BrowserWindow({
     width: 1200,
@@ -37,13 +87,14 @@ function createWindow() {
     win.loadURL('http://localhost:3000');
     win.webContents.openDevTools();
   } else {
-    win.loadFile(path.join(__dirname, 'renderer', 'out', 'index.html'));
+    win.loadFile(path.join(__dirname, 'renderer', 'dist', 'index.html'));
   }
+
+  return win;
 }
 
 app.whenReady().then(() => {
   createWindow();
-
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
   });
@@ -54,87 +105,136 @@ app.on('window-all-closed', () => {
 });
 
 // ---------------------------------------------------------------------------
-// IPC handlers — secure bridge between renderer and main process
+// Streaming helpers
 // ---------------------------------------------------------------------------
 
-const activeControllers = new Map(); // requestId -> AbortController
+/**
+ * Pump an SSE readable stream into renderer IPC events.
+ * Guards against window destruction (race on abort/close).
+ */
+async function pumpSSE(requestId, readableStream, sendToRenderer, cleanupRequestFn) {
+  const reader = readableStream.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
 
-ipcMain.handle('chutes:chat', async (_event, { requestId, params }) => {
   try {
-    const { response, abort } = await chutes.chat(params);
+    while (true) {
+      const { done: readerDone, value } = await reader.read();
+      if (readerDone) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || '';
+
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (trimmed.startsWith('data: ')) {
+          sendToRenderer(requestId, { requestId, data: trimmed.slice(6), done: false });
+        }
+      }
+    }
+
+    // Flush remaining buffer
+    if (buffer.trim().startsWith('data: ')) {
+      sendToRenderer(requestId, { requestId, data: buffer.trim().slice(6), done: false });
+    }
+  } catch (err) {
+    if (err.name !== 'AbortError') {
+      sendToRenderer(requestId, { requestId, error: err.message, done: true });
+    }
+  } finally {
+    reader.releaseLock();
+    sendToRenderer(requestId, { requestId, done: true });
+    cleanupRequestFn(requestId);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// IPC handlers
+// ---------------------------------------------------------------------------
+
+const activeControllers = new Map(); // requestId -> abort()
+const streamingWindows = new Map();  // requestId -> BrowserWindow
+
+/** Send a chunk/error to the renderer for a given request. */
+function sendToRenderer(requestId, payload) {
+  const win = streamingWindows.get(requestId);
+  if (!win || win.isDestroyed()) return false;
+
+  if (payload.error) {
+    win.webContents.send('chutes:error', payload);
+  } else {
+    win.webContents.send('chutes:chunk', payload);
+  }
+  return true;
+}
+
+/** Cleanup a request's state. */
+function cleanupRequest(requestId) {
+  activeControllers.delete(requestId);
+  streamingWindows.delete(requestId);
+}
+
+ipcMain.handle('chutes:chat', async (event, { requestId, params }) => {
+  const win = BrowserWindow.fromWebContents(event.sender);
+  streamingWindows.set(requestId, win);
+
+  try {
+    const t = await getTransport();
+    const { response, abort } = await t.chat(params);
     activeControllers.set(requestId, abort);
 
     if (params.stream) {
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = '';
-
-      const pump = async () => {
-        try {
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-
-            buffer += decoder.decode(value, { stream: true });
-            const lines = buffer.split('\n');
-            buffer = lines.pop() || '';
-
-            for (const line of lines) {
-              if (line.trim().startsWith('data: ')) {
-                const data = line.trim().slice(6);
-                if (data === '[DONE]') {
-                  BrowserWindow.getAllWindows()[0]?.webContents.send('chutes:chunk', { requestId, done: true });
-                } else {
-                  BrowserWindow.getAllWindows()[0]?.webContents.send('chutes:chunk', { requestId, data });
-                }
-              }
-            }
-          }
-
-          if (buffer.trim()) {
-            const line = buffer.trim();
-            if (line.startsWith('data: ')) {
-              BrowserWindow.getAllWindows()[0]?.webContents.send('chutes:chunk', {
-                requestId,
-                data: line.slice(6),
-              });
-            }
-          }
-
-          BrowserWindow.getAllWindows()[0]?.webContents.send('chutes:chunk', { requestId, done: true });
-        } catch (err) {
-          BrowserWindow.getAllWindows()[0]?.webContents.send('chutes:error', {
-            requestId,
-            error: err.message,
-          });
-        }
-      };
-
-      pump();
+      pumpSSE(requestId, response.body, sendToRenderer, cleanupRequest);
       return { ok: true, stream: true };
     }
 
     const body = await response.json();
-    activeControllers.delete(requestId);
+    cleanupRequest(requestId);
     return { ok: true, stream: false, body };
   } catch (err) {
-    activeControllers.delete(requestId);
+    cleanupRequest(requestId);
     return { ok: false, error: err.message };
   }
 });
 
 ipcMain.handle('chutes:abort', (_event, { requestId }) => {
-  const abort = activeControllers.get(requestId);
-  if (abort) {
-    abort();
-    activeControllers.delete(requestId);
-  }
+  activeControllers.get(requestId)?.();
+  cleanupRequest(requestId);
 });
 
 ipcMain.handle('chutes:models', async () => {
   try {
-    const models = await chutes.getModels();
+    const t = await getTransport();
+    const models = await t.getModels();
     return { ok: true, models };
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+});
+
+ipcMain.handle('settings:saveApiKey', async (_event, { provider, apiKey }) => {
+  try {
+    if (provider !== 'chutes') {
+      return { ok: false, error: 'Unsupported provider. Use "chutes".' };
+    }
+    const creds = await loadCredentials();
+    creds.chutesApiKey = apiKey;
+    await saveCredentials(creds);
+    setApiKey(apiKey);
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+});
+
+ipcMain.handle('settings:getApiKey', async (_event, { provider }) => {
+  try {
+    if (provider !== 'chutes') {
+      return { ok: false, error: 'Unsupported provider. Use "chutes".' };
+    }
+    const creds = await loadCredentials();
+    return { ok: true, apiKey: creds.chutesApiKey || '' };
   } catch (err) {
     return { ok: false, error: err.message };
   }
