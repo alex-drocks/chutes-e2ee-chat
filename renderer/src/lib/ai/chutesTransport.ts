@@ -1,13 +1,17 @@
 import type { ChatTransport, FileUIPart, UIMessage, UIMessageChunk } from 'ai';
 import type { Message, MessageAttachment } from '@/lib/types';
 
-type ChutesChatBody = {
+export type ChutesChatConfig = {
   model?: string;
   toolsEnabled?: boolean;
   includeImages?: boolean;
 };
 
-type ChutesMessageMetadata = {
+type ChutesChatTransportOptions = {
+  getConfig?: () => ChutesChatConfig;
+};
+
+export type ChutesMessageMetadata = {
   attachments?: MessageAttachment[];
   memoryContext?: Message['memoryContext'];
   memoryContextText?: string;
@@ -44,12 +48,15 @@ export type ChutesUIMessage = UIMessage<
 const DEFAULT_MODEL = 'Qwen/Qwen3-32B-TEE';
 
 export class ChutesChatTransport implements ChatTransport<ChutesUIMessage> {
+  constructor(private readonly options: ChutesChatTransportOptions = {}) {}
+
   async sendMessages({
     messages,
     abortSignal,
     body,
+    metadata,
   }: Parameters<ChatTransport<ChutesUIMessage>['sendMessages']>[0]) {
-    const config = (body || {}) as ChutesChatBody;
+    const config = resolveChutesChatConfig(this.options.getConfig?.(), metadata, body);
     const toolsEnabled = config.toolsEnabled !== false;
     const requestId = crypto.randomUUID();
     const textId = `text-${requestId}`;
@@ -250,15 +257,51 @@ export function buildStandardTools(): ChutesToolDefinition[] {
   ];
 }
 
-function toChutesMessages(messages: ChutesUIMessage[], config: ChutesChatBody): ChatApiMessage[] {
+function resolveChutesChatConfig(
+  defaults: unknown,
+  metadata: unknown,
+  body: unknown,
+): ChutesChatConfig {
+  return {
+    ...readChutesChatConfig(defaults),
+    ...readChutesChatConfig(metadata),
+    ...readChutesChatConfig(body),
+  };
+}
+
+function readChutesChatConfig(value: unknown): ChutesChatConfig {
+  if (!value || typeof value !== 'object') return {};
+  const record = value as Record<string, unknown>;
+  const source =
+    record.custom && typeof record.custom === 'object'
+      ? (record.custom as Record<string, unknown>)
+      : record;
+
+  return {
+    ...(typeof source.model === 'string' ? { model: source.model } : {}),
+    ...(typeof source.toolsEnabled === 'boolean' ? { toolsEnabled: source.toolsEnabled } : {}),
+    ...(typeof source.includeImages === 'boolean' ? { includeImages: source.includeImages } : {}),
+  };
+}
+
+function toChutesMessages(messages: ChutesUIMessage[], config: ChutesChatConfig): ChatApiMessage[] {
   const apiMessages: ChatApiMessage[] = [];
+  const hasToolOutputs = hasToolOutputParts(messages);
   if (config.toolsEnabled !== false) {
     apiMessages.push({
       role: 'system',
       content:
         `Current date: ${new Date().toISOString()}.\n` +
         'You have access to the web_search tool. Use it autonomously when the user asks for live, recent, source-backed, or changing information such as weather, news, prices, current events, or schedules. ' +
-        'Do not claim you lack real-time web access for those requests; call web_search and answer from the returned role:tool results.',
+        'Use at most one web_search call per user request, then answer directly from the returned role:tool results. ' +
+        'Do not call web_search again to verify, refine, or repeat the same search unless the user explicitly asks for another search.',
+    });
+  } else if (hasToolOutputs) {
+    apiMessages.push({
+      role: 'system',
+      content:
+        `Current date: ${new Date().toISOString()}.\n` +
+        'You have already received tool results for this user request. Do not request, simulate, or write another tool call. Answer directly and concisely from the provided role:tool results.',
     });
   }
 
@@ -311,7 +354,18 @@ function toChutesMessages(messages: ChutesUIMessage[], config: ChutesChatBody): 
   return apiMessages;
 }
 
-function userMessageContent(message: ChutesUIMessage, config: ChutesChatBody): string | ChutesMessageContentPart[] {
+function hasToolOutputParts(messages: ChutesUIMessage[]) {
+  return messages.some((message) =>
+    message.role === 'assistant' &&
+    collectToolParts(message.parts).some((part) =>
+      part.state === 'output-available' ||
+      part.state === 'output-error' ||
+      part.state === 'output-denied',
+    ),
+  );
+}
+
+function userMessageContent(message: ChutesUIMessage, config: ChutesChatConfig): string | ChutesMessageContentPart[] {
   const textBlocks = [collectText(message.parts)];
   const metadata = message.metadata;
   const attachments = metadata?.attachments || [];

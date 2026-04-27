@@ -1,4 +1,5 @@
 @import 'tailwindcss';
+@source "../../node_modules/streamdown/dist/*.js";
 
 @theme {
   --bg-primary:    #0f0f0f;

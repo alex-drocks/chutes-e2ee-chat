@@ -14,6 +14,7 @@
     "next": "^16.2.4",
     "react": "^19.2.5",
     "react-dom": "^19.2.5",
+    "streamdown": "^1.1.4",
     "tailwindcss": "^4.2.4"
   },
   "devDependencies": {
