@@ -83,7 +83,7 @@ export default function ChatPage() {
   const [messages, setMessages] = useState<Message[]>([WELCOME_MESSAGE]);
   const [input, setInput] = useState('');
   const [attachments, setAttachments] = useState<MessageAttachment[]>([]);
-  const [webSearchEnabled, setWebSearchEnabled] = useState(false);
+  const [webSearchEnabled, setWebSearchEnabled] = useState(true);
   const [isLoading, setIsLoading] = useState(false);
   const [streamStage, setStreamStage] = useState<StreamStage>('idle');
   const [model, setModelState] = useState(DEFAULT_MODEL);
@@ -1026,7 +1026,7 @@ export default function ChatPage() {
                 ? 'bg-[var(--accent)] text-black'
                 : 'bg-[var(--bg-tertiary)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
             }`}
-            title="Use web search"
+            title={webSearchEnabled ? 'Web search tools enabled automatically' : 'Web search tools disabled'}
           >
             <Search className="w-4 h-4" />
           </button>
@@ -1063,8 +1063,8 @@ export default function ChatPage() {
           {isLoading
             ? 'Working… click stop to interrupt and redirect'
             : webSearchEnabled
-            ? 'Web search enabled · ML-KEM-768 · ChaCha20-Poly1305 · HKDF-SHA256 — End-to-end encrypted via Chutes.ai TEE'
-            : 'ML-KEM-768 · ChaCha20-Poly1305 · HKDF-SHA256 — End-to-end encrypted via Chutes.ai TEE'}
+            ? 'Web search auto · ML-KEM-768 · ChaCha20-Poly1305 · HKDF-SHA256 — End-to-end encrypted via Chutes.ai TEE'
+            : 'Web search off · ML-KEM-768 · ChaCha20-Poly1305 · HKDF-SHA256 — End-to-end encrypted via Chutes.ai TEE'}
         </p>
       </div>
     </div>

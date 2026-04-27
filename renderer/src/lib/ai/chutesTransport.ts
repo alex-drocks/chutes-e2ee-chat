@@ -50,6 +50,7 @@ export class ChutesChatTransport implements ChatTransport<ChutesUIMessage> {
     body,
   }: Parameters<ChatTransport<ChutesUIMessage>['sendMessages']>[0]) {
     const config = (body || {}) as ChutesChatBody;
+    const toolsEnabled = config.toolsEnabled !== false;
     const requestId = crypto.randomUUID();
     const textId = `text-${requestId}`;
     const reasoningId = `reasoning-${requestId}`;
@@ -187,9 +188,9 @@ export class ChutesChatTransport implements ChatTransport<ChutesUIMessage> {
 
         window.chutes.chat(requestId, {
           model: config.model || DEFAULT_MODEL,
-          messages: toChutesMessages(messages, config),
+          messages: toChutesMessages(messages, { ...config, toolsEnabled }),
           stream: true,
-          ...(config.toolsEnabled ? { tools: buildStandardTools(), tool_choice: 'auto' } : {}),
+          ...(toolsEnabled ? { tools: buildStandardTools(), tool_choice: 'auto' } : {}),
         }).then((res) => {
           if (!res.ok && !closed) {
             closed = true;
@@ -251,13 +252,13 @@ export function buildStandardTools(): ChutesToolDefinition[] {
 
 function toChutesMessages(messages: ChutesUIMessage[], config: ChutesChatBody): ChatApiMessage[] {
   const apiMessages: ChatApiMessage[] = [];
-  if (config.toolsEnabled) {
+  if (config.toolsEnabled !== false) {
     apiMessages.push({
       role: 'system',
       content:
         `Current date: ${new Date().toISOString()}.\n` +
-        'Use web_search when live, recent, source-backed, or changing information is needed. ' +
-        'Tool results are fetched by the app from the live web and returned as role:tool messages.',
+        'You have access to the web_search tool. Use it autonomously when the user asks for live, recent, source-backed, or changing information such as weather, news, prices, current events, or schedules. ' +
+        'Do not claim you lack real-time web access for those requests; call web_search and answer from the returned role:tool results.',
     });
   }
 
