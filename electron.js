@@ -116,6 +116,7 @@ async function pumpSSE(requestId, readableStream, sendToRenderer, cleanupRequest
   const reader = readableStream.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
+  let chunkCount = 0;
 
   try {
     while (true) {
@@ -129,6 +130,7 @@ async function pumpSSE(requestId, readableStream, sendToRenderer, cleanupRequest
       for (const line of lines) {
         const trimmed = line.trim();
         if (trimmed.startsWith('data: ')) {
+          chunkCount += 1;
           sendToRenderer(requestId, { requestId, data: trimmed.slice(6), done: false });
         }
       }
@@ -136,15 +138,24 @@ async function pumpSSE(requestId, readableStream, sendToRenderer, cleanupRequest
 
     // Flush remaining buffer
     if (buffer.trim().startsWith('data: ')) {
+      chunkCount += 1;
       sendToRenderer(requestId, { requestId, data: buffer.trim().slice(6), done: false });
+    }
+
+    // Detect completely empty stream (no meaningful chunks)
+    if (chunkCount === 0) {
+      sendToRenderer(requestId, { requestId, error: 'The model returned an empty response. It may be warming up or at capacity.', done: true });
+    } else {
+      sendToRenderer(requestId, { requestId, done: true });
     }
   } catch (err) {
     if (err.name !== 'AbortError') {
       sendToRenderer(requestId, { requestId, error: err.message, done: true });
+    } else {
+      sendToRenderer(requestId, { requestId, done: true });
     }
   } finally {
     reader.releaseLock();
-    sendToRenderer(requestId, { requestId, done: true });
     cleanupRequestFn(requestId);
   }
 }
