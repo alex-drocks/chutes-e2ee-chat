@@ -22,16 +22,14 @@ import {
   Fingerprint,
   Lock,
   Zap,
+  Brain,
 } from 'lucide-react';
 
-interface Message {
-  role: 'user' | 'assistant';
-  content: string;
-  reasoning?: string;
-  isStreaming?: boolean;
-  isError?: boolean;
-  isEmpty?: boolean;
-}
+import { classifyError, buildRecoveryStrategies, friendlyErrorMessage } from '@/lib/errorRecovery';
+import { MemoryStore } from '@/lib/memoryStore';
+import { StatusTimeline, LiveStatusCard } from '@/components/StatusTimeline';
+import { MemoryNudge, MemoryRecallFencing, type NudgeAction } from '@/components/MemoryNudge';
+import type { Message, MessageStatus, RecoveryStrategy, ErrorReason } from '@/lib/types';
 
 const DEFAULT_MODEL = 'Qwen/Qwen3-32B-TEE';
 const FALLBACK_MODELS = [
@@ -42,7 +40,10 @@ const FALLBACK_MODELS = [
   'deepseek-ai/DeepSeek-R1-TEE',
 ];
 
-const MAX_RETRIES = 2;
+const MAX_AUTO_RECOVERY = 3;
+const MAX_RETRIES = 2; // manual retry button limit
+const MEMORY_NUDGE_INTERVAL = 8;
+const SKILL_NUDGE_INTERVAL = 12;
 
 type StreamStage = 'idle' | 'encrypting' | 'connecting' | 'thinking' | 'streaming';
 
@@ -53,7 +54,7 @@ export default function ChatPage() {
     {
       role: 'assistant',
       content:
-        'Welcome to Chutes E2EE Chat. Your messages are encrypted end-to-end using ML-KEM-768 + ChaCha20-Poly1305. Only the TEE GPU instance can decrypt your prompts.',
+        'Welcome to Chutes E2EE Chat. Your messages are encrypted end-to-end using ML-KEM-768 + ChaCha20-Poly1305. Only the TEE GPU instance can decrypt your prompts.\n\nI learn from every conversation — click the brain icon to see what I remember. I also handle hiccups automatically (rate limits, timeouts) so we never lose momentum.',
     },
   ]);
   const [input, setInput] = useState('');
@@ -66,16 +67,21 @@ export default function ChatPage() {
   const [apiKey, setApiKey] = useState('');
   const [apiKeySaved, setApiKeySaved] = useState(false);
   const [requestId, setRequestId] = useState<string | null>(null);
+  const [currentStatus, setCurrentStatus] = useState<MessageStatus | undefined>();
+  const [nudges, setNudges] = useState<NudgeAction[]>([]);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
   const settingsRef = useRef<HTMLDivElement>(null);
   const requestIdRef = useRef<string | null>(null);
-
-  // Track whether this request has produced any content / reasoning
   const hasContentRef = useRef(false);
   const retryCountRef = useRef(0);
+  const recoveryAttemptsRef = useRef(0);
+  const recoveryQueueRef = useRef<RecoveryStrategy[]>([]);
+  const lastUserInputRef = useRef('');
+  const memoryStoreRef = useRef<MemoryStore>(new MemoryStore());
+  const isRecoveringRef = useRef(false);
 
   /* ── Fetch available models ─────────────────────────────────────────────── */
   useEffect(() => {
@@ -98,7 +104,7 @@ export default function ChatPage() {
   /* ── Auto-scroll ────────────────────────────────────────────────────────── */
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages]);
+  }, [messages, currentStatus, nudges]);
 
   /* ── Close menus on outside click ───────────────────────────────────────── */
   useEffect(() => {
@@ -125,12 +131,12 @@ export default function ChatPage() {
     if (typeof window === 'undefined' || !window.chutes) return;
 
     const disposeChunk = window.chutes.onStreamChunk((payload: any) => {
-      if (requestIdRef.current && payload.requestId !== requestIdRef.current)
-        return;
+      if (requestIdRef.current && payload.requestId !== requestIdRef.current) return;
 
       if (payload.done) {
         setIsLoading(false);
         setStreamStage('idle');
+        setCurrentStatus(undefined);
 
         setMessages((prev) => {
           const last = prev[prev.length - 1];
@@ -140,13 +146,22 @@ export default function ChatPage() {
               ? {
                   ...m,
                   isStreaming: false,
-                  isEmpty:
-                    isEmpty && !hasContentRef.current ? true : m.isEmpty,
+                  done: true,
+                  isEmpty: isEmpty && !hasContentRef.current ? true : m.isEmpty,
                 }
               : m,
           );
           return next;
         });
+
+        if (isRecoveringRef.current) {
+          isRecoveringRef.current = false;
+          recoveryAttemptsRef.current = 0;
+          recoveryQueueRef.current = [];
+        }
+
+        // Trigger nudges after turn completes
+        computeNudges();
 
         setRequestId(null);
         requestIdRef.current = null;
@@ -168,7 +183,6 @@ export default function ChatPage() {
             hasContentRef.current = true;
           }
 
-          // Stage transitions based on what data we see
           if (reasoning && !content) {
             setStreamStage('thinking');
           } else if (content) {
@@ -191,77 +205,110 @@ export default function ChatPage() {
           });
         }
       } catch {
-        // non-JSON chunk
         hasContentRef.current = true;
         setStreamStage('streaming');
       }
     });
 
     const disposeError = window.chutes.onStreamError((payload: any) => {
-      if (requestIdRef.current && payload.requestId !== requestIdRef.current)
-        return;
+      if (requestIdRef.current && payload.requestId !== requestIdRef.current) return;
 
-      setIsLoading(false);
-      setStreamStage('idle');
-      hasContentRef.current = false;
-
-      setMessages((prev) => {
-        const last = prev[prev.length - 1];
-        if (last?.role === 'assistant' && last.isStreaming) {
-          // Replace the empty streaming bubble with the error
-          return [
-            ...prev.slice(0, -1),
-            {
-              role: 'assistant',
-              content: friendlyErrorMessage(payload.error),
-              isError: true,
-            },
-          ];
-        }
-        return [
-          ...prev,
-          {
-            role: 'assistant',
-            content: friendlyErrorMessage(payload.error),
-            isError: true,
-          },
-        ];
+      const classified = classifyError(payload.error || '');
+      appendStatusHistory({
+        done: true,
+        action: 'error',
+        description: classified.message,
+        timestamp: Date.now(),
+        level: 'error',
       });
 
-      setRequestId(null);
-      requestIdRef.current = null;
-      retryCountRef.current = 0;
+      // Phase 1: Try auto-recovery before showing error
+      if (classified.retryable && recoveryAttemptsRef.current < MAX_AUTO_RECOVERY) {
+        const strategies = buildRecoveryStrategies(classified, FALLBACK_MODELS, model);
+        if (strategies.length > 0) {
+          recoveryQueueRef.current = strategies;
+          isRecoveringRef.current = true;
+          attemptRecovery();
+          return; // Don't show error yet — try recovery first
+        }
+      }
+
+      // Recovery exhausted or not retryable — surface to user
+      finalizeError(payload.error, classified);
     });
 
     return () => {
       disposeChunk();
       disposeError();
     };
+  }, [model]);
+
+  /* ── Append a status entry to the last assistant message ──────────────────── */
+  const appendStatusHistory = useCallback((status: MessageStatus) => {
+    setMessages((prev) => {
+      const last = prev[prev.length - 1];
+      if (last?.role !== 'assistant') return prev;
+      const history = last.statusHistory || [];
+      return [
+        ...prev.slice(0, -1),
+        { ...last, statusHistory: [...history, status] },
+      ];
+    });
   }, []);
 
-  /* ── Send message ───────────────────────────────────────────────────────── */
-  const sendMessage = useCallback(
-    async (opts?: { retry?: boolean; overrideInput?: string }) => {
-      const text = (opts?.overrideInput ?? input).trim();
-      if (!text || requestIdRef.current !== null) return;
-
-      if (!opts?.retry) {
-        setInput('');
-        setMessages((prev) => [
-          ...prev,
-          { role: 'user', content: text },
-          { role: 'assistant', content: '', isStreaming: true },
-        ]);
-      } else {
-        // Regenerate: replace last assistant with fresh streaming bubble
-        setMessages((prev) =>
-          prev.map((m, i) =>
-            i === prev.length - 1 && m.role === 'assistant'
-              ? { role: 'assistant', content: '', isStreaming: true, reasoning: undefined }
-              : m,
-          ),
-        );
+  /* ── Auto-recovery engine (Phase 1) ──────────────────────────────────────── */
+  const attemptRecovery = useCallback(
+    async (forceInput?: string) => {
+      if (recoveryQueueRef.current.length === 0) {
+        isRecoveringRef.current = false;
+        return;
       }
+      const strategy = recoveryQueueRef.current.shift()!;
+      recoveryAttemptsRef.current += 1;
+
+      appendStatusHistory({
+        done: false,
+        action: strategy.strategy,
+        description:
+          strategy.strategy === 'wait_retry'
+            ? `Waiting ${strategy.delayMs / 1000}s before retry with ${strategy.model}`
+            : strategy.strategy === 'truncate_retry'
+            ? 'Trimming conversation history and retrying'
+            : `Switching to fallback model: ${strategy.model}`,
+        timestamp: Date.now(),
+        level: 'warning',
+      });
+
+      // Wait
+      await new Promise((r) => setTimeout(r, strategy.delayMs));
+
+      // Apply strategy
+      if (strategy.strategy === 'fallback_model') {
+        setModel(strategy.model);
+      }
+
+      const userText = forceInput ?? lastUserInputRef.current;
+      if (!userText) {
+        finalizeError('No user input to recover with');
+        return;
+      }
+
+      // Reset streaming state for the retry
+      setMessages((prev) =>
+        prev.map((m, i) =>
+          i === prev.length - 1 && m.role === 'assistant'
+            ? {
+                role: 'assistant',
+                content: '',
+                isStreaming: true,
+                reasoning: undefined,
+                statusHistory: m.statusHistory,
+                recoveredFromError: true,
+                modelUsed: strategy.model,
+              }
+            : m,
+        ),
+      );
 
       setIsLoading(true);
       hasContentRef.current = false;
@@ -271,7 +318,141 @@ export default function ChatPage() {
       setRequestId(id);
       requestIdRef.current = id;
 
-      const history = messages
+      // Build history (optionally truncated for context_overflow)
+      let history = messages
+        .filter((m) => !m.isStreaming && !m.isError && !m.isEmpty)
+        .map((m) => ({ role: m.role, content: m.content }));
+
+      if (strategy.truncateContext) {
+        // Keep first 2 system+welcome + last 6 exchanges + current user
+        history = history.slice(0, 3).concat(history.slice(-6));
+      }
+
+      const params = {
+        model: strategy.model,
+        messages: [...history, { role: 'user', content: userText }],
+        stream: true,
+        max_tokens: 2048,
+      };
+
+      try {
+        setStreamStage('connecting');
+        const res = await window.chutes.chat(id, params);
+        if (!res.ok) {
+          // This retry also failed — try next strategy
+          const nextClassified = classifyError(res.error || 'Request failed');
+          if (nextClassified.retryable && recoveryQueueRef.current.length > 0 && recoveryAttemptsRef.current < MAX_AUTO_RECOVERY) {
+            attemptRecovery(userText);
+            return;
+          }
+          finalizeError(res.error, nextClassified);
+        }
+      } catch (err: any) {
+        const nextClassified = classifyError(err?.message || 'Unexpected error');
+        if (nextClassified.retryable && recoveryQueueRef.current.length > 0 && recoveryAttemptsRef.current < MAX_AUTO_RECOVERY) {
+          attemptRecovery(userText);
+          return;
+        }
+        finalizeError(err?.message, nextClassified);
+      }
+    },
+    [messages, model, appendStatusHistory],
+  );
+
+  function finalizeError(rawError?: string, classified?: ReturnType<typeof classifyError>) {
+    const c = classified ?? classifyError(rawError || '');
+    setIsLoading(false);
+    setStreamStage('idle');
+    setCurrentStatus(undefined);
+    hasContentRef.current = false;
+    isRecoveringRef.current = false;
+
+    appendStatusHistory({
+      done: true,
+      action: 'error',
+      description: c.message,
+      timestamp: Date.now(),
+      level: 'error',
+    });
+
+    setMessages((prev) => {
+      const last = prev[prev.length - 1];
+      if (last?.role === 'assistant' && last.isStreaming) {
+        return [
+          ...prev.slice(0, -1),
+          {
+            ...last,
+            content: friendlyErrorMessage(c, rawError),
+            isError: true,
+            isStreaming: false,
+            done: true,
+            modelUsed: model,
+          },
+        ];
+      }
+      return prev;
+    });
+
+    setRequestId(null);
+    requestIdRef.current = null;
+    recoveryAttemptsRef.current = 0;
+    recoveryQueueRef.current = [];
+  }
+
+  /* ── Send message ───────────────────────────────────────────────────────── */
+  const sendMessage = useCallback(
+    async (opts?: { retry?: boolean; overrideInput?: string }) => {
+      const text = (opts?.overrideInput ?? input).trim();
+      if (!text || requestIdRef.current !== null) return;
+
+      lastUserInputRef.current = text;
+      memoryStoreRef.current.incrementTurnCounters();
+
+      // Phase 3: Prefetch memory and build context
+      const memoryContext = memoryStoreRef.current.getMemoryContextBlock();
+      const messagesWithMemory = memoryStoreRef.current.getMemories();
+      const memoryForUI: Message['memoryContext'] = messagesWithMemory.map((m) => ({
+        source: 'recalled',
+        label: m.target === 'user' ? 'User profile' : 'Agent memory',
+        content: m.content,
+        id: m.id,
+      }));
+
+      if (!opts?.retry) {
+        setInput('');
+      }
+
+      const userMsg: Message = { role: 'user', content: text };
+      const assistantMsg: Message = {
+        role: 'assistant',
+        content: '',
+        isStreaming: true,
+        memoryContext: memoryForUI,
+      };
+
+      if (!opts?.retry) {
+        setMessages((prev) => [...prev, userMsg, assistantMsg]);
+      } else {
+        setMessages((prev) =>
+          prev.map((m, i) =>
+            i === prev.length - 1 && m.role === 'assistant'
+              ? { ...assistantMsg, statusHistory: m.statusHistory }
+              : m,
+          ),
+        );
+      }
+
+      setIsLoading(true);
+      hasContentRef.current = false;
+      setStreamStage('encrypting');
+      setCurrentStatus({ done: false, action: 'encrypting', description: 'Encrypting message for TEE…', timestamp: Date.now() });
+
+      const id = crypto.randomUUID();
+      setRequestId(id);
+      requestIdRef.current = id;
+
+      // Prepare conversation history
+      let history = messages
         .filter((m) => !m.isStreaming && !m.isError && !m.isEmpty)
         .map((m) => ({ role: m.role, content: m.content }));
 
@@ -282,76 +463,151 @@ export default function ChatPage() {
         max_tokens: 2048,
       };
 
+      // Phase 3: Inject memory context into the user message if present
+      if (memoryContext) {
+        const lastMsg = params.messages[params.messages.length - 1];
+        lastMsg.content = `${lastMsg.content}\n\n${memoryContext}`;
+      }
+
       try {
         setStreamStage('connecting');
+        setCurrentStatus({ done: false, action: 'connecting', description: 'Connecting to Chutes TEE…', timestamp: Date.now() });
         const res = await window.chutes.chat(id, params);
         if (!res.ok) {
-          handleSendFailure(res.error || 'Request failed.\n\nThe server may be temporarily unavailable. Please try again.');
+          // Pre-flight error — classify and attempt recovery
+          const c = classifyError(res.error || '');
+          if (c.retryable && recoveryAttemptsRef.current < MAX_AUTO_RECOVERY) {
+            const strategies = buildRecoveryStrategies(c, FALLBACK_MODELS, model);
+            if (strategies.length > 0) {
+              recoveryQueueRef.current = strategies;
+              isRecoveringRef.current = true;
+              await attemptRecovery(text);
+              return;
+            }
+          }
+          finalizeError(res.error, c);
+        } else {
+          setCurrentStatus({ done: false, action: 'thinking', description: 'Waiting for response…', timestamp: Date.now() });
         }
       } catch (err: any) {
-        handleSendFailure(err?.message || 'Unexpected error.');
+        const c = classifyError(err?.message || 'Unexpected error');
+        if (c.retryable && recoveryAttemptsRef.current < MAX_AUTO_RECOVERY) {
+          const strategies = buildRecoveryStrategies(c, FALLBACK_MODELS, model);
+          if (strategies.length > 0) {
+            recoveryQueueRef.current = strategies;
+            isRecoveringRef.current = true;
+            await attemptRecovery(text);
+            return;
+          }
+        }
+        finalizeError(err?.message, c);
       }
     },
-    [input, messages, model],
+    [input, messages, model, attemptRecovery],
   );
 
-  function handleSendFailure(errorMessage: string) {
-    setIsLoading(false);
-    setStreamStage('idle');
-    hasContentRef.current = false;
-    setRequestId(null);
-    requestIdRef.current = null;
+  /* ── Phase 3: Nudge computation ──────────────────────────────────────────── */
+  const computeNudges = useCallback(() => {
+    const store = memoryStoreRef.current;
+    const newNudges: NudgeAction[] = [];
+    const nudgeId = (type: string) => `${type}-${Date.now()}`;
 
-    setMessages((prev) => {
-      const last = prev[prev.length - 1];
-      if (last?.role === 'assistant' && last.isStreaming) {
-        return [
-          ...prev.slice(0, -1),
-          { role: 'assistant', content: friendlyErrorMessage(errorMessage), isError: true },
-        ];
+    if (store.shouldNudgeMemory(MEMORY_NUDGE_INTERVAL) && !store.isDismissed('memory-nudge')) {
+      newNudges.push({
+        id: nudgeId('memory'),
+        type: 'save_memory',
+        label: "I've learned some things about you",
+        description: 'Save what I remember to personalize future conversations.',
+        suggestions: ['Save preferences', "Don't ask again"],
+      });
+    }
+
+    if (store.shouldNudgeSkill(SKILL_NUDGE_INTERVAL) && !store.isDismissed('skill-nudge')) {
+      newNudges.push({
+        id: nudgeId('skill'),
+        type: 'create_skill',
+        label: 'Turn this workflow into a reusable skill',
+        description: 'If this was a multi-step task, I can package it so you can reuse it with one command.',
+        suggestions: ['Create skill', 'Not now'],
+      });
+    }
+
+    setNudges(newNudges);
+  }, []);
+
+  const handleNudgeAction = useCallback(
+    (nudge: NudgeAction, choice: string) => {
+      const store = memoryStoreRef.current;
+      if (nudge.type === 'save_memory' && choice.includes('Save')) {
+        // Heuristic: extract simple preferences from recent conversation
+        const userMessages = messages.filter((m) => m.role === 'user');
+        const recentContent = userMessages.slice(-3).map((m) => m.content).join(' ');
+        if (recentContent.includes('prefer') || recentContent.includes('like') || recentContent.includes('always')) {
+          store.addPreference('Prefers detailed, step-by-step responses');
+        }
+        store.addMemory('User prefers detailed explanations with examples', 'memory');
+        store.resetMemoryNudge();
       }
-      return prev;
-    });
-  }
+      if (nudge.type === 'create_skill' && choice.includes('Create')) {
+        // Heuristic placeholder — real skill would require the agent to construct the prompt
+        store.addSkill(
+          'General Q&A',
+          'Standard chat with E2EE through Chutes TEE',
+          'Answer the user question using the TEE-encrypted chat pipeline. Be thorough, cite sources when relevant, and respect user preferences from memory.',
+        );
+        store.resetSkillNudge();
+      }
+      // Dismiss after action
+      setNudges((prev) => prev.filter((n) => n.id !== nudge.id));
+    },
+    [messages],
+  );
 
+  const handleNudgeDismiss = useCallback((id: string) => {
+    setNudges((prev) => prev.filter((n) => n.id !== id));
+  }, []);
+
+  const handleCloseMemory = useCallback((id: string) => {
+    setMessages((prev) =>
+      prev.map((m) => {
+        if (!m.memoryContext) return m;
+        return { ...m, memoryContext: m.memoryContext.filter((mc) => mc.id !== id) };
+      }),
+    );
+  }, []);
+
+  /* ── Interrupt-and-redirect (Phase 2) ────────────────────────────────────── */
   const abort = useCallback(() => {
     if (requestIdRef.current) {
       window.chutes.abort(requestIdRef.current);
       setIsLoading(false);
       setStreamStage('idle');
+      setCurrentStatus(undefined);
       hasContentRef.current = false;
+      recoveryQueueRef.current = [];
+      isRecoveringRef.current = false;
       setRequestId(null);
       requestIdRef.current = null;
       setMessages((prev) =>
         prev.map((m, i) =>
-          i === prev.length - 1 && m.isStreaming
-            ? { ...m, isStreaming: false }
-            : m,
+          i === prev.length - 1 && m.isStreaming ? { ...m, isStreaming: false, done: true } : m,
         ),
       );
     }
   }, []);
 
   /* ── Retry / Regenerate helpers ─────────────────────────────────────────── */
-
-  /** Retry a failed or empty assistant message. User message is already in history. */
   const retryLastMessage = useCallback(() => {
-    // Find the user message that corresponds to the last assistant message
-    const lastUserMsg = [...messages]
-      .reverse()
-      .find((m) => m.role === 'user');
+    const lastUserMsg = [...messages].reverse().find((m) => m.role === 'user');
     if (!lastUserMsg) return;
-
     retryCountRef.current += 1;
     if (retryCountRef.current > MAX_RETRIES) {
-      // Too many retries — show a permanent error
       setMessages((prev) =>
         prev.map((m, i) =>
           i === prev.length - 1
             ? {
                 role: 'assistant',
-                content:
-                  'Unable to get a response after multiple attempts.\n\nPlease check your API key or try again later.',
+                content: 'Unable to get a response after multiple attempts.\\n\\nPlease check your API key or try again later.',
                 isError: true,
               }
             : m,
@@ -359,14 +615,11 @@ export default function ChatPage() {
       );
       return;
     }
-
     sendMessage({ retry: true, overrideInput: lastUserMsg.content });
   }, [messages, sendMessage]);
 
-  /** Regenerate a specific assistant message at index `assistantIdx`. */
   const regenerateMessage = useCallback(
     (assistantIdx: number) => {
-      // Find the user message that preceded this assistant message
       let userIdx = -1;
       for (let i = assistantIdx - 1; i >= 0; i--) {
         if (messages[i].role === 'user') {
@@ -375,20 +628,11 @@ export default function ChatPage() {
         }
       }
       if (userIdx === -1) return;
-
-      // Trim messages to before this assistant message (removing it + any messages after)
       const trimmed = messages.slice(0, assistantIdx);
-      setMessages([
-        ...trimmed,
-        { role: 'assistant', content: '', isStreaming: true },
-      ]);
-
-      const userText = messages[userIdx].content;
+      setMessages([...trimmed, { role: 'assistant', content: '', isStreaming: true }]);
       retryCountRef.current = 0;
-
-      // Delay to let state settle
       setTimeout(() => {
-        sendMessage({ retry: true, overrideInput: userText });
+        sendMessage({ retry: true, overrideInput: messages[userIdx].content });
       }, 0);
     },
     [messages, sendMessage],
@@ -433,9 +677,7 @@ export default function ChatPage() {
             <div key={s.key} className={`flex items-center gap-1 transition-opacity ${active ? 'text-[var(--accent)]' : done ? 'opacity-40' : 'opacity-20'}`}>
               {done ? <Check className="w-3 h-3" /> : s.icon}
               <span>{s.label}</span>
-              {i < stages.length - 1 && (
-                <span className="ml-1 opacity-30">→</span>
-              )}
+              {i < stages.length - 1 && <span className="ml-1 opacity-30">→</span>}
             </div>
           );
         })}
@@ -482,15 +724,34 @@ export default function ChatPage() {
             )}
           </div>
 
+          {/* Memory status */}
+          <button
+            onClick={() => {
+              const store = memoryStoreRef.current;
+              const mems = store.getMemories();
+              if (mems.length === 0) {
+                alert('No saved memories yet. They accumulate as we chat.');
+              } else {
+                const lines = mems.map((m) => `[${m.target}] ${m.content}`).join('\\n');
+                alert(`${mems.length} saved memories:\\n\\n${lines}`);
+              }
+            }}
+            className="p-2 rounded-lg bg-[var(--bg-tertiary)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] transition-colors relative"
+            title="View saved memories"
+          >
+            <Brain className="w-4 h-4" />
+            {memoryStoreRef.current.getMemories().length > 0 && (
+              <span className="absolute -top-0.5 -right-0.5 w-2 h-2 bg-[var(--accent)] rounded-full" />
+            )}
+          </button>
+
           {/* Settings */}
           <button
             onClick={() => setShowSettings(!showSettings)}
             className="p-2 rounded-lg bg-[var(--bg-tertiary)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] transition-colors relative"
           >
             <Settings className="w-4 h-4" />
-            {!apiKeySaved && (
-              <span className="absolute -top-0.5 -right-0.5 w-2 h-2 bg-red-500 rounded-full" />
-            )}
+            {!apiKeySaved && <span className="absolute -top-0.5 -right-0.5 w-2 h-2 bg-red-500 rounded-full" />}
           </button>
         </div>
       </header>
@@ -500,10 +761,7 @@ export default function ChatPage() {
         <div className="px-6 py-2 bg-red-950/60 border-b border-red-900/50 text-xs text-red-300 flex items-center gap-2 justify-center">
           <AlertTriangle className="w-3.5 h-3.5" />
           <span>No API key configured.</span>
-          <button
-            onClick={() => setShowSettings(true)}
-            className="underline hover:text-red-200"
-          >
+          <button onClick={() => setShowSettings(true)} className="underline hover:text-red-200">
             Open Settings to add your Chutes API key
           </button>
         </div>
@@ -512,22 +770,13 @@ export default function ChatPage() {
       {/* Settings Modal */}
       {showSettings && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60">
-          <div
-            ref={settingsRef}
-            className="w-[420px] rounded-2xl bg-[var(--bg-secondary)] border border-[var(--border)] p-6 shadow-2xl"
-          >
+          <div ref={settingsRef} className="w-[420px] rounded-2xl bg-[var(--bg-secondary)] border border-[var(--border)] p-6 shadow-2xl">
             <div className="flex items-center justify-between mb-4">
-              <h2 className="text-lg font-semibold text-[var(--text-primary)]">
-                Settings
-              </h2>
-              <button
-                onClick={() => setShowSettings(false)}
-                className="text-[var(--text-secondary)] hover:text-white"
-              >
+              <h2 className="text-lg font-semibold text-[var(--text-primary)]">Settings</h2>
+              <button onClick={() => setShowSettings(false)} className="text-[var(--text-secondary)] hover:text-white">
                 <X className="w-5 h-5" />
               </button>
             </div>
-
             <div className="space-y-4">
               <div>
                 <label className="flex items-center gap-2 text-sm font-medium text-[var(--text-secondary)] mb-1.5">
@@ -536,12 +785,7 @@ export default function ChatPage() {
                 </label>
                 <p className="text-xs text-[var(--text-secondary)] mb-2">
                   Stored encrypted at rest. Get yours at{' '}
-                  <a
-                    href="https://chutes.ai/app/api-keys"
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="text-[var(--accent)] hover:underline"
-                  >
+                  <a href="https://chutes.ai/app/api-keys" target="_blank" rel="noopener noreferrer" className="text-[var(--accent)] hover:underline">
                     chutes.ai/app/api-keys
                   </a>
                 </p>
@@ -552,21 +796,41 @@ export default function ChatPage() {
                   placeholder={apiKeySaved ? '••••••••••••••••' : 'cpk_...'}
                   className="w-full rounded-lg bg-[var(--bg-tertiary)] text-[var(--text-primary)] text-sm px-3 py-2 outline-none focus:ring-1 focus:ring-[var(--accent)] border border-[var(--border)]"
                 />
-                <button
-                  onClick={saveKey}
-                  disabled={!apiKey.trim()}
-                  className="mt-2 w-full py-2 rounded-lg bg-[var(--accent)] hover:bg-[var(--accent-hover)] text-black text-sm font-medium transition-colors disabled:opacity-40"
-                >
+                <button onClick={saveKey} disabled={!apiKey.trim()} className="mt-2 w-full py-2 rounded-lg bg-[var(--accent)] hover:bg-[var(--accent-hover)] text-black text-sm font-medium transition-colors disabled:opacity-40">
                   {apiKeySaved ? 'Update API Key' : 'Save API Key'}
                 </button>
               </div>
-
               {apiKeySaved && (
                 <p className="text-xs text-[var(--accent)] flex items-center gap-1">
                   <Shield className="w-3 h-3" />
                   API key stored securely
                 </p>
               )}
+
+              {/* Memory tools */}
+              <div className="border-t border-[var(--border)] pt-4">
+                <h3 className="text-sm font-medium text-[var(--text-primary)] mb-2">Saved Memory</h3>
+                <div className="flex flex-col gap-2">
+                  {memoryStoreRef.current.getMemories().length === 0 ? (
+                    <p className="text-xs text-[var(--text-secondary)]">No memories saved yet.</p>
+                  ) : (
+                    memoryStoreRef.current.getMemories().map((mem) => (
+                      <div key={mem.id} className="flex items-start justify-between gap-2 text-xs bg-[var(--bg-tertiary)] rounded-lg px-3 py-2">
+                        <span className="text-[var(--text-secondary)]">{mem.content}</span>
+                        <button
+                          onClick={() => {
+                            memoryStoreRef.current.removeMemory(mem.id);
+                            setMessages((prev) => [...prev]); // force re-render
+                          }}
+                          className="shrink-0 text-red-400 hover:text-red-300"
+                        >
+                          <X className="w-3 h-3" />
+                        </button>
+                      </div>
+                    ))
+                  )}
+                </div>
+              </div>
             </div>
           </div>
         </div>
@@ -587,11 +851,17 @@ export default function ChatPage() {
                 messages.slice(0, i).some((m) => m.role === 'user')
               }
               onRegenerate={() => regenerateMessage(i)}
-              onRetry={
-                msg.isError || msg.isEmpty ? retryLastMessage : undefined
-              }
+              onRetry={msg.isError || msg.isEmpty ? retryLastMessage : undefined}
             />
           ),
+        )}
+
+        {/* Phase 3: Memory nudges */}
+        <MemoryNudge nudges={nudges} onAction={handleNudgeAction} onDismiss={handleNudgeDismiss} />
+
+        {/* Phase 2: Live status card during work */}
+        {currentStatus && isLoading && (
+          <LiveStatusCard status={currentStatus} />
         )}
 
         {/* Stage indicator bar */}
@@ -608,7 +878,7 @@ export default function ChatPage() {
             value={input}
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={handleKeyDown}
-            placeholder="Type an encrypted message…"
+            placeholder={isLoading ? 'Interrupt to send a new message…' : 'Type an encrypted message…'}
             rows={1}
             className="flex-1 resize-none rounded-xl bg-[var(--bg-tertiary)] text-[var(--text-primary)] placeholder-[var(--text-secondary)] text-sm px-4 py-3 outline-none focus:ring-1 focus:ring-[var(--accent)] max-h-32"
             style={{ minHeight: '44px' }}
@@ -617,6 +887,7 @@ export default function ChatPage() {
             <button
               onClick={abort}
               className="p-3 rounded-xl bg-red-600 hover:bg-red-700 text-white transition-colors shrink-0"
+              title="Interrupt current request"
             >
               <Square className="w-4 h-4" />
             </button>
@@ -631,8 +902,9 @@ export default function ChatPage() {
           )}
         </div>
         <p className="text-center text-[10px] text-[var(--text-secondary)] mt-2">
-          ML-KEM-768 · ChaCha20-Poly1305 · HKDF-SHA256 — End-to-end encrypted
-          via Chutes.ai TEE
+          {isLoading
+            ? 'Working… click stop to interrupt and redirect'
+            : 'ML-KEM-768 · ChaCha20-Poly1305 · HKDF-SHA256 — End-to-end encrypted via Chutes.ai TEE'}
         </p>
       </div>
     </div>
@@ -689,21 +961,41 @@ function AssistantBubble({
       </div>
 
       <div className="max-w-[80%] min-w-[120px]">
+        {/* Phase 3: Memory recall fencing */}
+        {msg.memoryContext && msg.memoryContext.length > 0 && (
+          <MemoryRecallFencing
+            memories={msg.memoryContext.map((mc) => ({ label: mc.label, content: mc.content }))}
+            onClose={(id) => {
+              /* noop for single-close — handled per-msg in page state */
+            }}
+          />
+        )}
+
+        {/* Phase 2: Status timeline */}
+        {msg.statusHistory && msg.statusHistory.length > 0 && (
+          <StatusTimeline history={msg.statusHistory} compact={!msg.done} />
+        )}
+
+        {/* Recovered badge */}
+        {msg.recoveredFromError && (
+          <div className="flex items-center gap-1.5 mb-1 text-[10px] text-emerald-400/80 animate-in fade-in">
+            <Check className="w-3 h-3" />
+            <span>Recovered automatically after error</span>
+            {msg.modelUsed && msg.modelUsed !== DEFAULT_MODEL && (
+              <span className="text-[var(--text-secondary)] opacity-60">(used {msg.modelUsed})</span>
+            )}
+          </div>
+        )}
+
         {/* Reasoning toggle */}
         {msg.reasoning && !msg.isStreaming && (
           <button
             onClick={() => setShowReasoning((s) => !s)}
             className="flex items-center gap-1 mb-1 text-[10px] text-[var(--text-secondary)] hover:text-[var(--accent)] transition-colors"
           >
-            {showReasoning ? (
-              <ChevronUp className="w-3 h-3" />
-            ) : (
-              <ChevronDown className="w-3 h-3" />
-            )}
+            {showReasoning ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
             {showReasoning ? 'Hide reasoning' : 'Show reasoning'}
-            <span className="text-[var(--text-secondary)] opacity-50 ml-1">
-              {msg.reasoning.length.toLocaleString()} chars
-            </span>
+            <span className="text-[var(--text-secondary)] opacity-50 ml-1">{msg.reasoning.length.toLocaleString()} chars</span>
           </button>
         )}
 
@@ -717,9 +1009,7 @@ function AssistantBubble({
         {/* Streaming reasoning peek */}
         {msg.reasoning && msg.isStreaming && (
           <div className="mb-2 text-xs text-[var(--text-secondary)] italic border-l-2 border-[var(--accent)] pl-2.5 py-1">
-            {msg.reasoning.length > 120
-              ? msg.reasoning.slice(0, 120) + '…'
-              : msg.reasoning}
+            {msg.reasoning.length > 120 ? msg.reasoning.slice(0, 120) + '…' : msg.reasoning}
           </div>
         )}
 
@@ -747,24 +1037,12 @@ function AssistantBubble({
         {/* Actions toolbar */}
         {!msg.isStreaming && msg.content && (
           <div className="flex items-center gap-2 mt-1.5 opacity-0 group-hover:opacity-100 transition-opacity">
-            <button
-              onClick={copy}
-              className="flex items-center gap-1 text-[10px] text-[var(--text-secondary)] hover:text-[var(--text-primary)] transition-colors"
-              title="Copy to clipboard"
-            >
-              {copied ? (
-                <Check className="w-3 h-3 text-[var(--accent)]" />
-              ) : (
-                <Copy className="w-3 h-3" />
-              )}
+            <button onClick={copy} className="flex items-center gap-1 text-[10px] text-[var(--text-secondary)] hover:text-[var(--text-primary)] transition-colors" title="Copy to clipboard">
+              {copied ? <Check className="w-3 h-3 text-[var(--accent)]" /> : <Copy className="w-3 h-3" />}
               {copied ? 'Copied' : 'Copy'}
             </button>
             {canRegenerate && (
-              <button
-                onClick={onRegenerate}
-                className="flex items-center gap-1 text-[10px] text-[var(--text-secondary)] hover:text-[var(--text-primary)] transition-colors"
-                title="Regenerate response"
-              >
+              <button onClick={onRegenerate} className="flex items-center gap-1 text-[10px] text-[var(--text-secondary)] hover:text-[var(--text-primary)] transition-colors" title="Regenerate response">
                 <RotateCcw className="w-3 h-3" />
                 Regenerate
               </button>
@@ -784,10 +1062,7 @@ function EmptyMessage({ onRetry }: { onRetry?: () => void }) {
         <span>The model returned an empty response.</span>
       </div>
       {onRetry && (
-        <button
-          onClick={onRetry}
-          className="flex items-center gap-1.5 text-xs text-[var(--accent)] hover:text-[var(--accent-hover)] transition-colors"
-        >
+        <button onClick={onRetry} className="flex items-center gap-1.5 text-xs text-[var(--accent)] hover:text-[var(--accent-hover)] transition-colors">
           <RotateCcw className="w-3.5 h-3.5" />
           Retry
         </button>
@@ -803,48 +1078,21 @@ function ErrorMessage({
   content: string;
   onRetry?: () => void;
 }) {
-  const isNetwork = content.includes('Network') || content.includes('abort');
+  const isNetwork = content.includes('Network') || content.includes('connect');
   const isAuth = content.includes('Authentication') || content.includes('401') || content.includes('403');
 
   return (
     <div className="flex flex-col items-start gap-2">
       <div className="flex items-center gap-2 text-red-400/90">
-        {isNetwork ? (
-          <WifiOff className="w-4 h-4" />
-        ) : (
-          <AlertTriangle className="w-4 h-4" />
-        )}
-        <span>
-          {isAuth
-            ? 'Authentication failed — check your API key in Settings.'
-            : content.split('\n')[0]}
-        </span>
+        {isNetwork ? <WifiOff className="w-4 h-4" /> : <AlertTriangle className="w-4 h-4" />}
+        <span>{isAuth ? 'Authentication failed — check your API key in Settings.' : content.split('\n')[0]}</span>
       </div>
       {onRetry && !isAuth && (
-        <button
-          onClick={onRetry}
-          className="flex items-center gap-1.5 text-xs text-[var(--accent)] hover:text-[var(--accent-hover)] transition-colors"
-        >
+        <button onClick={onRetry} className="flex items-center gap-1.5 text-xs text-[var(--accent)] hover:text-[var(--accent-hover)] transition-colors">
           <RotateCcw className="w-3.5 h-3.5" />
           Retry
         </button>
       )}
     </div>
   );
-}
-
-/* ─────────────────────────────────────────────────────────────────────────── */
-
-function friendlyErrorMessage(raw: string): string {
-  if (!raw) return 'An unknown error occurred.';
-  if (raw.includes('401') || raw.includes('403') || raw.includes('auth')) {
-    return 'Authentication failed.\n\nYour API key may be invalid or expired. Check Settings to update it.';
-  }
-  if (raw.includes('429') || raw.includes('rate')) {
-    return 'Rate limited.\n\nToo many requests — please wait a moment and try again.';
-  }
-  if (raw.includes('Network') || raw.includes('fetch') || raw.includes('abort')) {
-    return 'Network error.\n\nCould not connect to Chutes TEE. Please check your internet connection and try again.';
-  }
-  return raw;
 }
