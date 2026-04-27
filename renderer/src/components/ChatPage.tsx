@@ -41,6 +41,7 @@ const FALLBACK_MODELS = [
   'deepseek-ai/DeepSeek-R1-TEE',
 ];
 
+const MODEL_STORAGE_KEY = 'chutes-e2ee-chat.lastModel';
 const MAX_AUTO_RECOVERY = 3;
 const MAX_RETRIES = 2; // manual retry button limit
 const MEMORY_NUDGE_INTERVAL = 8;
@@ -78,8 +79,11 @@ export default function ChatPage() {
   const [input, setInput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const [streamStage, setStreamStage] = useState<StreamStage>('idle');
-  const [model, setModel] = useState(DEFAULT_MODEL);
+  const [model, setModelState] = useState(DEFAULT_MODEL);
   const [models, setModels] = useState<string[]>(FALLBACK_MODELS);
+  const [modelStats, setModelStats] = useState<Record<string, ChutesModelStats>>({});
+  const [modelStatsLoading, setModelStatsLoading] = useState(false);
+  const [modelStatsError, setModelStatsError] = useState('');
   const [showModelMenu, setShowModelMenu] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [apiKey, setApiKey] = useState('');
@@ -104,6 +108,17 @@ export default function ChatPage() {
   const memoryStoreRef = useRef<MemoryStore>(new MemoryStore());
   const isRecoveringRef = useRef(false);
 
+  const setModel = useCallback((nextModel: string) => {
+    setModelState(nextModel);
+    if (typeof window !== 'undefined') {
+      try {
+        window.localStorage.setItem(MODEL_STORAGE_KEY, nextModel);
+      } catch {
+        /* ignore unavailable storage */
+      }
+    }
+  }, []);
+
   const applyApiKeyStatus = useCallback((res: any) => {
     if (!res.ok) {
       setApiKeyError(res.error || 'Could not read API key status.');
@@ -124,6 +139,19 @@ export default function ChatPage() {
     setApiKeySaved(nextStatus.hasApiKey);
   }, []);
 
+  /* ── Load last selected model ───────────────────────────────────────────── */
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    try {
+      const storedModel = window.localStorage.getItem(MODEL_STORAGE_KEY);
+      if (storedModel) {
+        setModelState(storedModel);
+      }
+    } catch {
+      /* ignore unavailable storage */
+    }
+  }, []);
+
   /* ── Fetch available models ─────────────────────────────────────────────── */
   useEffect(() => {
     if (typeof window === 'undefined' || !window.chutes) return;
@@ -132,6 +160,38 @@ export default function ChatPage() {
         setModels(res.models.filter((m: string) => m.includes('TEE')));
       }
     });
+  }, []);
+
+  /* ── Fetch recent public model stats without blocking chat ──────────────── */
+  useEffect(() => {
+    if (typeof window === 'undefined' || !window.chutes) return;
+
+    let cancelled = false;
+    const timer = window.setTimeout(() => {
+      setModelStatsLoading(true);
+      window.chutes.modelStats().then((res) => {
+        if (cancelled) return;
+        if (res.ok && res.stats) {
+          setModelStats(res.stats);
+          setModelStatsError('');
+        } else {
+          setModelStatsError(res.error || 'Stats unavailable');
+        }
+      }).catch((err) => {
+        if (!cancelled) {
+          setModelStatsError(err?.message || 'Stats unavailable');
+        }
+      }).finally(() => {
+        if (!cancelled) {
+          setModelStatsLoading(false);
+        }
+      });
+    }, 1200);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
   }, []);
 
   /* ── Load stored API key ────────────────────────────────────────────────── */
@@ -216,7 +276,7 @@ export default function ChatPage() {
 
         if (delta) {
           const content = delta.content || '';
-          const reasoning = delta.reasoning_content || '';
+          const reasoning = delta.reasoning_content || delta.reasoning || '';
 
           if (content || reasoning) {
             hasContentRef.current = true;
@@ -224,8 +284,10 @@ export default function ChatPage() {
 
           if (reasoning && !content) {
             setStreamStage('thinking');
+            setCurrentStatus({ done: false, action: 'thinking', description: 'Streaming model reasoning…', timestamp: Date.now() });
           } else if (content) {
             setStreamStage('streaming');
+            setCurrentStatus({ done: false, action: 'streaming', description: 'Streaming response…', timestamp: Date.now() });
           }
 
           setMessages((prev) => {
@@ -736,6 +798,8 @@ export default function ChatPage() {
     );
   };
 
+  const selectedModelStats = modelStats[model];
+
   return (
     <div className="flex flex-col h-screen bg-[var(--bg-primary)]">
       {/* Header */}
@@ -755,20 +819,33 @@ export default function ChatPage() {
               className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-[var(--bg-tertiary)] text-sm text-[var(--text-secondary)] hover:text-[var(--text-primary)] transition-colors"
             >
               <Sparkles className="w-3.5 h-3.5" />
-              <span className="max-w-[200px] truncate">{model}</span>
+              <span className="flex min-w-0 flex-col items-start">
+                <span className="max-w-[200px] truncate">{model}</span>
+                <ModelStatsLine
+                  stats={selectedModelStats}
+                  loading={modelStatsLoading && !selectedModelStats}
+                  error={modelStatsError}
+                />
+              </span>
               <ChevronDown className="w-3.5 h-3.5" />
             </button>
             {showModelMenu && (
-              <div className="absolute right-0 top-full mt-1 w-72 rounded-lg bg-[var(--bg-secondary)] border border-[var(--border)] shadow-xl z-50 py-1 max-h-64 overflow-auto">
+              <div className="absolute right-0 top-full mt-1 w-80 rounded-lg bg-[var(--bg-secondary)] border border-[var(--border)] shadow-xl z-50 py-1 max-h-80 overflow-auto">
                 {models.map((m) => (
                   <button
                     key={m}
                     onClick={() => { setModel(m); setShowModelMenu(false); }}
-                    className={`w-full text-left px-3 py-2 text-sm hover:bg-[var(--bg-tertiary)] transition-colors truncate ${
+                    className={`w-full text-left px-3 py-2 text-sm hover:bg-[var(--bg-tertiary)] transition-colors ${
                       m === model ? 'text-[var(--accent)]' : 'text-[var(--text-secondary)]'
                     }`}
                   >
-                    {m}
+                    <span className="flex items-center justify-between gap-3">
+                      <span className="min-w-0">
+                        <span className="block truncate">{m}</span>
+                        <ModelStatsLine stats={modelStats[m]} />
+                      </span>
+                      {m === model && <Check className="w-3.5 h-3.5 shrink-0" />}
+                    </span>
                   </button>
                 ))}
               </div>
@@ -984,6 +1061,47 @@ export default function ChatPage() {
 /*  Sub-components                                                            */
 /* ─────────────────────────────────────────────────────────────────────────── */
 
+function formatStatsNumber(value: number, options: { suffix?: string } = {}) {
+  if (!Number.isFinite(value) || value <= 0) return null;
+  const formatted = value >= 100 ? Math.round(value).toLocaleString() : value.toFixed(1);
+  return `${formatted}${options.suffix || ''}`;
+}
+
+function ModelStatsLine({
+  stats,
+  loading = false,
+  error = '',
+}: {
+  stats?: ChutesModelStats;
+  loading?: boolean;
+  error?: string;
+}) {
+  if (!stats) {
+    if (loading) {
+      return <span className="text-[10px] leading-tight opacity-50">Loading stats...</span>;
+    }
+    if (error) {
+      return <span className="text-[10px] leading-tight opacity-40">Stats unavailable</span>;
+    }
+    return null;
+  }
+
+  const tps = formatStatsNumber(stats.averageTps);
+  const ttft = formatStatsNumber(stats.averageTtft, { suffix: 's' });
+  if (!tps && !ttft) return null;
+
+  return (
+    <span
+      className="text-[10px] leading-tight text-[var(--text-secondary)] opacity-70"
+      title={`Daily average from ${stats.date}${stats.totalRequests ? ` across ${stats.totalRequests.toLocaleString()} requests` : ''}`}
+    >
+      {tps ? `${tps} TPS` : 'TPS n/a'}
+      {' · '}
+      {ttft ? `${ttft} TTFT` : 'TTFT n/a'}
+    </span>
+  );
+}
+
 function UserBubble({ content }: { content: string }) {
   return (
     <div className="flex gap-3 justify-end">
@@ -1009,7 +1127,15 @@ function AssistantBubble({
   onRetry?: () => void;
 }) {
   const [copied, setCopied] = useState(false);
-  const [showReasoning, setShowReasoning] = useState(false);
+  const [showReasoning, setShowReasoning] = useState(true);
+  const [showStreamingReasoning, setShowStreamingReasoning] = useState(true);
+  const streamingReasoningRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const el = streamingReasoningRef.current;
+    if (!el || !msg.isStreaming || !showStreamingReasoning) return;
+    el.scrollTop = el.scrollHeight;
+  }, [msg.reasoning, msg.isStreaming, showStreamingReasoning]);
 
   const copy = async () => {
     try {
@@ -1021,7 +1147,7 @@ function AssistantBubble({
     }
   };
 
-  const isEmptyOrError = msg.isError || msg.isEmpty;
+  const showMainContent = Boolean(msg.content) || Boolean(msg.isError) || Boolean(msg.isEmpty) || !msg.reasoning;
 
   return (
     <div className="flex gap-3 justify-start group">
@@ -1069,39 +1195,57 @@ function AssistantBubble({
         )}
 
         {/* Reasoning content */}
-        {showReasoning && msg.reasoning && (
-          <div className="mb-2 text-xs text-[var(--text-secondary)] italic border-l-2 border-[var(--accent)]/50 pl-2.5 py-1 animate-in fade-in">
+        {showReasoning && msg.reasoning && !msg.isStreaming && (
+          <div className="mb-2 text-xs text-[var(--text-secondary)] italic border-l-2 border-[var(--accent)]/50 pl-2.5 py-1 animate-in fade-in whitespace-pre-wrap">
             {msg.reasoning}
           </div>
         )}
 
-        {/* Streaming reasoning peek */}
+        {/* Streaming reasoning */}
         {msg.reasoning && msg.isStreaming && (
-          <div className="mb-2 text-xs text-[var(--text-secondary)] italic border-l-2 border-[var(--accent)] pl-2.5 py-1">
-            {msg.reasoning.length > 120 ? msg.reasoning.slice(0, 120) + '…' : msg.reasoning}
+          <div className="mb-2 rounded-xl border border-[var(--border)] bg-[var(--bg-secondary)]/80 animate-in fade-in overflow-hidden">
+            <button
+              type="button"
+              onClick={() => setShowStreamingReasoning((s) => !s)}
+              className="w-full flex items-center justify-between gap-3 px-3 py-2 text-[10px] text-[var(--text-secondary)] hover:text-[var(--accent)] transition-colors"
+            >
+              <span className="flex items-center gap-1.5">
+                <Brain className="w-3 h-3" />
+                Thinking
+                <span className="opacity-50">{msg.reasoning.length.toLocaleString()} chars</span>
+              </span>
+              {showStreamingReasoning ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
+            </button>
+            {showStreamingReasoning && (
+              <div ref={streamingReasoningRef} className="max-h-[40vh] overflow-y-auto border-t border-[var(--border)] px-3 py-2 text-xs leading-relaxed text-[var(--text-secondary)] italic whitespace-pre-wrap">
+                {msg.reasoning}
+              </div>
+            )}
           </div>
         )}
 
         {/* Main content */}
-        <div
-          className={`rounded-2xl px-4 py-2.5 text-sm leading-relaxed whitespace-pre-wrap bg-[var(--assistant-bubble)] text-[var(--text-primary)] rounded-bl-md ${
-            msg.isError ? 'border border-red-900/60 bg-red-950/30' : ''
-          } ${msg.isEmpty ? 'border border-yellow-900/40 bg-yellow-950/20' : ''}`}
-        >
-          {msg.content || msg.isStreaming ? (
-            msg.content
-          ) : msg.isEmpty ? (
-            <EmptyMessage onRetry={onRetry} />
-          ) : msg.isError ? (
-            <ErrorMessage content={msg.content} onRetry={onRetry} />
-          ) : (
-            <span className="italic opacity-40">No response</span>
-          )}
+        {showMainContent && (
+          <div
+            className={`rounded-2xl px-4 py-2.5 text-sm leading-relaxed whitespace-pre-wrap bg-[var(--assistant-bubble)] text-[var(--text-primary)] rounded-bl-md ${
+              msg.isError ? 'border border-red-900/60 bg-red-950/30' : ''
+            } ${msg.isEmpty ? 'border border-yellow-900/40 bg-yellow-950/20' : ''}`}
+          >
+            {msg.content || msg.isStreaming ? (
+              msg.content
+            ) : msg.isEmpty ? (
+              <EmptyMessage onRetry={onRetry} />
+            ) : msg.isError ? (
+              <ErrorMessage content={msg.content} onRetry={onRetry} />
+            ) : (
+              <span className="italic opacity-40">No response</span>
+            )}
 
-          {msg.isStreaming && !msg.content && !msg.reasoning && (
-            <Loader2 className="w-4 h-4 animate-spin text-[var(--accent)]" />
-          )}
-        </div>
+            {msg.isStreaming && !msg.content && !msg.reasoning && (
+              <Loader2 className="w-4 h-4 animate-spin text-[var(--accent)]" />
+            )}
+          </div>
+        )}
 
         {/* Actions toolbar */}
         {!msg.isStreaming && msg.content && (

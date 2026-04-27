@@ -9,6 +9,7 @@ declare global {
       }) => Promise<{ ok: boolean; stream?: boolean; body?: any; error?: string }>;
       abort: (requestId: string) => void;
       models: () => Promise<{ ok: boolean; models?: string[]; error?: string }>;
+      modelStats: () => Promise<{ ok: boolean; stats?: Record<string, ChutesModelStats>; error?: string }>;
       onStreamChunk: (callback: (payload: { requestId: string; data?: string; done?: boolean }) => void) => () => void;
       onStreamError: (callback: (payload: { requestId: string; error: string }) => void) => () => void;
       saveApiKey: (provider: string, apiKey: string) => Promise<ApiKeyStatusResponse>;
@@ -27,6 +28,17 @@ declare global {
     storageBackend?: string;
     isOsBackedStorage?: boolean;
     error?: string;
+  };
+
+  type ChutesModelStats = {
+    chuteId: string;
+    name: string;
+    date: string;
+    totalRequests: number;
+    totalInputTokens: number;
+    totalOutputTokens: number;
+    averageTps: number;
+    averageTtft: number;
   };
 }
 

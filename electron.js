@@ -13,7 +13,7 @@ import fs from 'node:fs';
 import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
 
 import { ChutesE2EETransport } from './lib/chutes/ChutesE2EETransport.js';
-import { DEFAULT_MODELS_BASE } from './lib/chutes/constants.js';
+import { DEFAULT_API_BASE, DEFAULT_MODELS_BASE } from './lib/chutes/constants.js';
 
 const require = createRequire(import.meta.url);
 const { app, BrowserWindow, ipcMain, net, protocol, safeStorage } = require('electron');
@@ -23,6 +23,8 @@ const rendererDistDir = path.join(__dirname, 'renderer', 'dist');
 const API_KEY_PROVIDER = 'chutes';
 const MAX_API_KEY_LENGTH = 512;
 const CREDENTIALS_AAD = Buffer.from('chutes-e2ee-chat.credentials.v2');
+const MODEL_STATS_CACHE_TTL_MS = 30 * 60 * 1000;
+const MODEL_STATS_LOOKBACK_DAYS = 3;
 
 protocol.registerSchemesAsPrivileged([
   {
@@ -403,6 +405,80 @@ async function pumpSSE(requestId, readableStream, sendToRenderer, cleanupRequest
 
 const activeControllers = new Map(); // requestId -> abort()
 const streamingWindows = new Map();  // requestId -> BrowserWindow
+let modelStatsCache = { loadedAt: 0, value: null, promise: null };
+
+function toIsoDateDaysAgo(daysAgo) {
+  const date = new Date();
+  date.setUTCDate(date.getUTCDate() - daysAgo);
+  return date.toISOString().slice(0, 10);
+}
+
+function finiteNumber(value) {
+  const num = Number(value);
+  return Number.isFinite(num) ? num : 0;
+}
+
+function latestStatsByModel(rows) {
+  const stats = {};
+
+  for (const row of rows) {
+    if (!row || typeof row.name !== 'string' || row.name === '[private]') continue;
+
+    const current = stats[row.name];
+    if (current && String(current.date) >= String(row.date)) continue;
+
+    stats[row.name] = {
+      chuteId: row.chute_id,
+      name: row.name,
+      date: row.date,
+      totalRequests: finiteNumber(row.total_requests),
+      totalInputTokens: finiteNumber(row.total_input_tokens),
+      totalOutputTokens: finiteNumber(row.total_output_tokens),
+      averageTps: finiteNumber(row.average_tps),
+      averageTtft: finiteNumber(row.average_ttft),
+    };
+  }
+
+  return stats;
+}
+
+async function fetchModelStats() {
+  const now = Date.now();
+  if (modelStatsCache.value && now - modelStatsCache.loadedAt < MODEL_STATS_CACHE_TTL_MS) {
+    return modelStatsCache.value;
+  }
+
+  if (modelStatsCache.promise) {
+    return modelStatsCache.promise;
+  }
+
+  const startDate = toIsoDateDaysAgo(MODEL_STATS_LOOKBACK_DAYS);
+  const endDate = toIsoDateDaysAgo(0);
+  const url = new URL('/invocations/stats/llm', DEFAULT_API_BASE);
+  url.searchParams.set('start_date', startDate);
+  url.searchParams.set('end_date', endDate);
+
+  modelStatsCache.promise = fetch(url, {
+    signal: AbortSignal.timeout(12_000),
+    headers: { accept: 'application/json' },
+  })
+    .then(async (response) => {
+      if (!response.ok) {
+        throw new Error(`Stats request failed: HTTP ${response.status}`);
+      }
+      const body = await response.json();
+      const rows = Array.isArray(body) ? body : Array.isArray(body?.data) ? body.data : [];
+      const value = latestStatsByModel(rows);
+      modelStatsCache = { loadedAt: Date.now(), value, promise: null };
+      return value;
+    })
+    .catch((err) => {
+      modelStatsCache.promise = null;
+      throw err;
+    });
+
+  return modelStatsCache.promise;
+}
 
 /** Send a chunk/error to the renderer for a given request. */
 function sendToRenderer(requestId, payload) {
@@ -463,6 +539,16 @@ ipcMain.handle('chutes:models', async (event) => {
     const t = await getTransport();
     const models = await t.getModels();
     return { ok: true, models };
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+});
+
+ipcMain.handle('chutes:modelStats', async (event) => {
+  try {
+    assertTrustedSender(event);
+    const stats = await fetchModelStats();
+    return { ok: true, stats };
   } catch (err) {
     return { ok: false, error: err.message };
   }

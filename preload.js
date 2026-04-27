@@ -23,6 +23,9 @@ const chutesAPI = {
   /** Get available models. */
   models: () => ipcRenderer.invoke('chutes:models'),
 
+  /** Get cached public LLM model stats. */
+  modelStats: () => ipcRenderer.invoke('chutes:modelStats'),
+
   /** Register callback for stream chunks. Returns a disposer function. */
   onStreamChunk: (callback) => on('chutes:chunk', callback),
 
