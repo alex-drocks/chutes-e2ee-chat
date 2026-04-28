@@ -1,7 +1,6 @@
 const MEMORY_KEY = 'chutes-memory-v1';
 const USER_PROFILE_KEY = 'chutes-user-profile-v1';
 const SKILLS_KEY = 'chutes-skills-v1';
-const NUDGE_STATE_KEY = 'chutes-nudge-state-v1';
 
 export interface Memory {
   id: string;
@@ -28,25 +27,10 @@ export interface Skill {
   useCount: number;
 }
 
-export interface NudgeState {
-  turnsSinceMemoryNudge: number;
-  turnsSinceSkillNudge: number;
-  lastMemoryNudgeAt: number;
-  lastSkillNudgeAt: number;
-  dismissedNudgeIds: string[];
-}
-
 export class MemoryStore {
   private memories: Memory[] = [];
   private profile: UserProfile = { preferences: [], conventions: [], lastUpdated: 0 };
   private skills: Skill[] = [];
-  private nudge: NudgeState = {
-    turnsSinceMemoryNudge: 0,
-    turnsSinceSkillNudge: 0,
-    lastMemoryNudgeAt: 0,
-    lastSkillNudgeAt: 0,
-    dismissedNudgeIds: [],
-  };
 
   constructor() {
     this.load();
@@ -61,8 +45,6 @@ export class MemoryStore {
       if (prof) this.profile = JSON.parse(prof);
       const sk = localStorage.getItem(SKILLS_KEY);
       if (sk) this.skills = JSON.parse(sk);
-      const ns = localStorage.getItem(NUDGE_STATE_KEY);
-      if (ns) this.nudge = JSON.parse(ns);
     } catch {
       // ignore corrupt storage
     }
@@ -73,7 +55,6 @@ export class MemoryStore {
     localStorage.setItem(MEMORY_KEY, JSON.stringify(this.memories));
     localStorage.setItem(USER_PROFILE_KEY, JSON.stringify(this.profile));
     localStorage.setItem(SKILLS_KEY, JSON.stringify(this.skills));
-    localStorage.setItem(NUDGE_STATE_KEY, JSON.stringify(this.nudge));
   }
 
   addMemory(content: string, target: 'memory' | 'user' = 'memory'): Memory {
@@ -171,48 +152,5 @@ export class MemoryStore {
       s.useCount++;
       this.save();
     }
-  }
-
-  // ── Nudge tracking ──
-
-  incrementTurnCounters() {
-    this.nudge.turnsSinceMemoryNudge++;
-    this.nudge.turnsSinceSkillNudge++;
-    this.save();
-  }
-
-  resetMemoryNudge() {
-    this.nudge.turnsSinceMemoryNudge = 0;
-    this.nudge.lastMemoryNudgeAt = Date.now();
-    this.save();
-  }
-
-  resetSkillNudge() {
-    this.nudge.turnsSinceSkillNudge = 0;
-    this.nudge.lastSkillNudgeAt = Date.now();
-    this.save();
-  }
-
-  shouldNudgeMemory(interval = 10): boolean {
-    return this.nudge.turnsSinceMemoryNudge >= interval;
-  }
-
-  shouldNudgeSkill(interval = 15): boolean {
-    return this.nudge.turnsSinceSkillNudge >= interval;
-  }
-
-  dismissNudge(id: string) {
-    if (!this.nudge.dismissedNudgeIds.includes(id)) {
-      this.nudge.dismissedNudgeIds.push(id);
-      this.save();
-    }
-  }
-
-  isDismissed(id: string): boolean {
-    return this.nudge.dismissedNudgeIds.includes(id);
-  }
-
-  getNudgeState(): NudgeState {
-    return { ...this.nudge };
   }
 }
