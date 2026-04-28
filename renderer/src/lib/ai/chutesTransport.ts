@@ -102,8 +102,10 @@ export class ChutesChatTransport implements ChatTransport<ChutesUIMessage> {
         };
 
         const finish = () => {
-          const textToolCalls = extractTextToolCalls(templateToolBuffer);
-          queuePendingToolCalls(textToolCalls.toolCalls, pendingToolCalls);
+          if (toolsEnabled) {
+            const textToolCalls = extractTextToolCalls(templateToolBuffer);
+            queuePendingToolCalls(textToolCalls.toolCalls, pendingToolCalls);
+          }
           templateToolBuffer = '';
 
           if (textStarted) safeEnqueue({ type: 'text-end', id: textId });
@@ -174,7 +176,7 @@ export class ChutesChatTransport implements ChatTransport<ChutesUIMessage> {
             emitText(visibleContent);
             emitReasoning(String(delta.reasoning_content || delta.reasoning || ''));
 
-            if (Array.isArray(delta.tool_calls)) {
+            if (toolsEnabled && Array.isArray(delta.tool_calls)) {
               accumulateToolCallDeltas(delta.tool_calls, pendingToolCalls);
             }
           } catch (err: any) {
@@ -344,7 +346,9 @@ function toChutesMessages(messages: ChutesUIMessage[], config: ChutesChatConfig)
       role: 'system',
       content:
         `Current date: ${new Date().toISOString()}.\n` +
-        'You have already received tool results for this user request. Do not request, simulate, or write another tool call. Answer directly and concisely from the provided role:tool results.',
+        'You have already received tool results for this user request. NO tools are available on this turn. ' +
+        'Do not request, simulate, output template-style, or write another tool call. ' +
+        'Answer directly and concisely from the provided role:tool results.',
     });
   }
 
