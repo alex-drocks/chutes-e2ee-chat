@@ -82,11 +82,16 @@ export class MemoryStore {
     }
   }
 
-  private save() {
-    if (typeof window === 'undefined') return;
-    localStorage.setItem(MEMORY_KEY, JSON.stringify(this.entries));
-    localStorage.setItem(USER_PROFILE_KEY, JSON.stringify(this.profile));
-    localStorage.setItem(SKILLS_KEY, JSON.stringify(this.skills));
+  private save(): boolean {
+    if (typeof window === 'undefined') return true;
+    try {
+      localStorage.setItem(MEMORY_KEY, JSON.stringify(this.entries));
+      localStorage.setItem(USER_PROFILE_KEY, JSON.stringify(this.profile));
+      localStorage.setItem(SKILLS_KEY, JSON.stringify(this.skills));
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   // -- Char budget helpers --
@@ -143,7 +148,15 @@ export class MemoryStore {
       updatedAt: Date.now(),
     };
     this.entries.push(entry);
-    this.save();
+    if (!this.save()) {
+      this.entries = this.entries.filter((m) => m.id !== entry.id);
+      return {
+        success: false,
+        error: 'Could not save memory. Browser storage may be full or unavailable.',
+        usage: `${this._charCount(target)}/${limit}`,
+        currentEntries: this._entriesFor(target).map((e) => e.content),
+      };
+    }
     return {
       success: true,
       usage: `${this._charCount(target)}/${limit}`,
@@ -183,9 +196,19 @@ export class MemoryStore {
       };
     }
 
+    const previousContent = matches[0].content;
+    const previousUpdatedAt = matches[0].updatedAt;
     matches[0].content = newContent;
     matches[0].updatedAt = Date.now();
-    this.save();
+    if (!this.save()) {
+      matches[0].content = previousContent;
+      matches[0].updatedAt = previousUpdatedAt;
+      return {
+        success: false,
+        error: 'Could not save memory. Browser storage may be full or unavailable.',
+        usage: `${this._charCount(target)}/${limit}`,
+      };
+    }
     return {
       success: true,
       usage: `${this._charCount(target)}/${limit}`,
@@ -206,8 +229,16 @@ export class MemoryStore {
       return { success: false, error: `Multiple entries matched '${oldText}'. Be more specific.`, currentEntries: previews };
     }
 
+    const previousEntries = this.entries;
     this.entries = this.entries.filter((e) => e.id !== matches[0].id);
-    this.save();
+    if (!this.save()) {
+      this.entries = previousEntries;
+      return {
+        success: false,
+        error: 'Could not save memory. Browser storage may be full or unavailable.',
+        usage: `${this._charCount(target)}/${this._charLimit(target)}`,
+      };
+    }
     return {
       success: true,
       usage: `${this._charCount(target)}/${this._charLimit(target)}`,
@@ -235,6 +266,7 @@ export class MemoryStore {
   getMemoryContextBlock(): string {
     // Fallback full dump — kept for case where recallFor is not used.
     const memoryParts = this._entriesFor('memory').map((e) => e.content);
+    const userEntryParts = this._entriesFor('user').map((e) => e.content);
     const userParts: string[] = [];
     if (this.profile.preferences.length) {
       userParts.push(`User preferences: ${this.profile.preferences.join('; ')}`);
@@ -242,7 +274,7 @@ export class MemoryStore {
     if (this.profile.conventions.length) {
       userParts.push(`User conventions: ${this.profile.conventions.join('; ')}`);
     }
-    const parts = [...userParts, ...memoryParts];
+    const parts = [...userParts, ...userEntryParts, ...memoryParts];
     if (!parts.length) return '';
     return (
       '<memory-context>\n' +
@@ -335,6 +367,14 @@ export class MemoryStore {
     if (this.profile.conventions.length) {
       const conv = `User conventions: ${this.profile.conventions.join('; ')}`;
       results.push({ id: 'profile-conventions', label: 'User profile', content: conv, recallReason: 'profile' });
+    }
+    for (const entry of this._entriesFor('user')) {
+      results.push({
+        id: entry.id,
+        label: 'User profile',
+        content: entry.content,
+        recallReason: 'profile',
+      });
     }
     results.forEach((r) => seen.add(r.id));
 

@@ -42,10 +42,20 @@ export type ChutesUIMessage = UIMessage<
       input: { query: string };
       output: unknown;
     };
+    memory: {
+      input: {
+        action: 'add' | 'replace' | 'remove';
+        target: 'memory' | 'user';
+        content?: string;
+        old_text?: string;
+      };
+      output: unknown;
+    };
   }
 >;
 
 const DEFAULT_MODEL = 'Qwen/Qwen3-32B-TEE';
+const TOOL_CALLS_SECTION_MARKER = '<|tool_calls_section_begin|>';
 
 export class ChutesChatTransport implements ChatTransport<ChutesUIMessage> {
   constructor(private readonly options: ChutesChatTransportOptions = {}) {}
@@ -102,6 +112,15 @@ export class ChutesChatTransport implements ChatTransport<ChutesUIMessage> {
         };
 
         const finish = () => {
+          emitText(flushBufferedTextToolContent({
+            get buffer() {
+              return templateToolBuffer;
+            },
+            set buffer(value: string) {
+              templateToolBuffer = value;
+            },
+          }));
+
           const textToolCalls = extractTextToolCalls(templateToolBuffer);
           queuePendingToolCalls(textToolCalls.toolCalls, pendingToolCalls);
           templateToolBuffer = '';
@@ -158,6 +177,16 @@ export class ChutesChatTransport implements ChatTransport<ChutesUIMessage> {
 
           try {
             const parsed = JSON.parse(payload.data);
+            if (parsed.error) {
+              const message = typeof parsed.error === 'string'
+                ? parsed.error
+                : parsed.error?.message || JSON.stringify(parsed.error);
+              closed = true;
+              cleanup();
+              controller.error(new Error(message || 'Chutes stream failed.'));
+              return;
+            }
+
             const delta = parsed.choices?.[0]?.delta;
             if (!delta) return;
 
@@ -464,17 +493,41 @@ function collectToolParts(parts: ChutesUIMessage['parts']) {
 
 function bufferTextToolContent(content: string, state: { buffer: string }) {
   if (!content) return '';
-  const marker = '<|tool_calls_section_begin|>';
-  if (state.buffer) {
+  if (state.buffer.startsWith(TOOL_CALLS_SECTION_MARKER)) {
     state.buffer += content;
     return '';
   }
 
-  const markerIndex = content.indexOf(marker);
-  if (markerIndex === -1) return content;
+  const combined = state.buffer + content;
+  const markerIndex = combined.indexOf(TOOL_CALLS_SECTION_MARKER);
+  if (markerIndex !== -1) {
+    state.buffer = combined.slice(markerIndex);
+    return combined.slice(0, markerIndex);
+  }
 
-  state.buffer = content.slice(markerIndex);
-  return content.slice(0, markerIndex);
+  const pendingLength = getMarkerPrefixSuffixLength(combined, TOOL_CALLS_SECTION_MARKER);
+  if (pendingLength === 0) {
+    state.buffer = '';
+    return combined;
+  }
+
+  state.buffer = combined.slice(-pendingLength);
+  return combined.slice(0, -pendingLength);
+}
+
+function flushBufferedTextToolContent(state: { buffer: string }) {
+  if (!state.buffer || state.buffer.startsWith(TOOL_CALLS_SECTION_MARKER)) return '';
+  const text = state.buffer;
+  state.buffer = '';
+  return text;
+}
+
+function getMarkerPrefixSuffixLength(value: string, marker: string) {
+  const maxLength = Math.min(value.length, marker.length - 1);
+  for (let length = maxLength; length > 0; length -= 1) {
+    if (marker.startsWith(value.slice(-length))) return length;
+  }
+  return 0;
 }
 
 function accumulateToolCallDeltas(toolCalls: any[], pending: Map<number, PendingToolCall>) {
@@ -497,7 +550,7 @@ function accumulateToolCallDeltas(toolCalls: any[], pending: Map<number, Pending
 
 function extractTextToolCalls(content: string) {
   const toolCalls: PendingToolCall[] = [];
-  if (!content.includes('<|tool_calls_section_begin|>')) return { toolCalls };
+  if (!content.includes(TOOL_CALLS_SECTION_MARKER)) return { toolCalls };
 
   let callIndex = 0;
   const sectionPattern = /<\|tool_calls_section_begin\|>[\s\S]*?<\|tool_calls_section_end\|>/g;

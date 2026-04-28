@@ -38,6 +38,7 @@ import {
   ChutesModelNotFoundError,
 } from '../lib/chutes/errors.js';
 import { _fetchWithRetry } from '../lib/chutes/utils.js';
+import { ChutesE2EETransport } from '../lib/chutes/ChutesE2EETransport.js';
 
 describe('Protocol Invariants (no network)', () => {
 
@@ -246,6 +247,25 @@ describe('Protocol Invariants (no network)', () => {
     } catch (err) {
       assert.ok(err.status === 500 || err.message.includes('500'));
     }
+  });
+
+  it('should fail a stalled E2EE stream after the idle timeout', async () => {
+    const transport = new ChutesE2EETransport({ apiKey: '' });
+    const rawStream = new ReadableStream({
+      start() {
+        // Intentionally never enqueue or close.
+      },
+    });
+    const decorated = transport._decorateStream(rawStream, Buffer.alloc(0), { idleTimeoutMs: 20 });
+    const reader = decorated.getReader();
+
+    await assert.rejects(
+      Promise.race([
+        reader.read(),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('timed out waiting for idle timeout')), 500)),
+      ]),
+      /stream stalled/,
+    );
   });
 
 });

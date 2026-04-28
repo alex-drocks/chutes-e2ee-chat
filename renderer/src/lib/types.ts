@@ -38,30 +38,3 @@ export interface Message {
   recoveredFromError?: boolean;
   modelUsed?: string;
 }
-
-export type ErrorReason =
-  | 'rate_limit'
-  | 'auth'
-  | 'context_overflow'
-  | 'timeout'
-  | 'server_error'
-  | 'overloaded'
-  | 'network'
-  | 'unknown';
-
-export interface ClassifiedError {
-  reason: ErrorReason;
-  message: string;
-  retryable: boolean;
-  shouldRetryWithDelay: boolean;
-  shouldTruncateContext: boolean;
-  shouldFallback: boolean;
-  delayMs: number;
-}
-
-export interface RecoveryStrategy {
-  strategy: 'wait_retry' | 'truncate_retry' | 'fallback_model';
-  model: string;
-  delayMs: number;
-  truncateContext: boolean;
-}

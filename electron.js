@@ -18,7 +18,7 @@ import { ChutesE2EETransport } from './lib/chutes/ChutesE2EETransport.js';
 import { DEFAULT_API_BASE, DEFAULT_MODELS_BASE } from './lib/chutes/constants.js';
 
 const require = createRequire(import.meta.url);
-const { app, BrowserWindow, clipboard, ipcMain, net, protocol, safeStorage } = require('electron');
+const { app, BrowserWindow, clipboard, ipcMain, net, protocol, safeStorage, shell } = require('electron');
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const execFile = promisify(execFileCallback);
 const rendererUrl = process.env.ELECTRON_RENDERER_URL;
@@ -91,6 +91,19 @@ function assertTrustedSender(event) {
   if (!isTrustedRendererUrl(senderUrl)) {
     throw new Error('Untrusted renderer origin.');
   }
+}
+
+function isExternalHttpUrl(value) {
+  try {
+    const url = new URL(value);
+    return url.protocol === 'http:' || url.protocol === 'https:';
+  } catch {
+    return false;
+  }
+}
+
+function getErrorMessage(err) {
+  return err instanceof Error ? err.message : String(err || 'Unexpected error');
 }
 
 function normalizeApiKey(apiKey) {
@@ -298,17 +311,21 @@ function registerStaticRendererProtocol() {
       return new Response('Not found', { status: 404 });
     }
 
-    if (path.extname(filePath) === '.html') {
-      const html = await fs.promises.readFile(filePath);
-      return new Response(html, {
-        headers: {
-          'content-type': 'text/html; charset=utf-8',
-          'content-security-policy': contentSecurityPolicy,
-        },
-      });
-    }
+    try {
+      if (path.extname(filePath) === '.html') {
+        const html = await fs.promises.readFile(filePath);
+        return new Response(html, {
+          headers: {
+            'content-type': 'text/html; charset=utf-8',
+            'content-security-policy': contentSecurityPolicy,
+          },
+        });
+      }
 
-    return net.fetch(pathToFileURL(filePath).toString());
+      return net.fetch(pathToFileURL(filePath).toString());
+    } catch {
+      return new Response('Not found', { status: 404 });
+    }
   });
 }
 
@@ -327,6 +344,21 @@ function createWindow() {
 
   win.once('ready-to-show', () => {
     win.maximize();
+  });
+
+  win.webContents.setWindowOpenHandler(({ url }) => {
+    if (isExternalHttpUrl(url)) {
+      shell.openExternal(url).catch(() => {});
+    }
+    return { action: 'deny' };
+  });
+
+  win.webContents.on('will-navigate', (event, url) => {
+    if (isTrustedRendererUrl(url)) return;
+    event.preventDefault();
+    if (isExternalHttpUrl(url)) {
+      shell.openExternal(url).catch(() => {});
+    }
   });
 
   if (rendererUrl) {
@@ -377,16 +409,18 @@ async function pumpSSE(requestId, readableStream, sendToRenderer, cleanupRequest
       for (const line of lines) {
         const trimmed = line.trim();
         if (trimmed.startsWith('data: ')) {
-          chunkCount += 1;
-          sendToRenderer(requestId, { requestId, data: trimmed.slice(6), done: false });
+          const data = trimmed.slice(6);
+          if (data !== '[DONE]') chunkCount += 1;
+          sendToRenderer(requestId, { requestId, data, done: false });
         }
       }
     }
 
     // Flush remaining buffer
     if (buffer.trim().startsWith('data: ')) {
-      chunkCount += 1;
-      sendToRenderer(requestId, { requestId, data: buffer.trim().slice(6), done: false });
+      const data = buffer.trim().slice(6);
+      if (data !== '[DONE]') chunkCount += 1;
+      sendToRenderer(requestId, { requestId, data, done: false });
     }
 
     // Detect completely empty stream (no meaningful chunks)
@@ -396,8 +430,8 @@ async function pumpSSE(requestId, readableStream, sendToRenderer, cleanupRequest
       sendToRenderer(requestId, { requestId, done: true });
     }
   } catch (err) {
-    if (err.name !== 'AbortError') {
-      sendToRenderer(requestId, { requestId, error: err.message, done: true });
+    if (err?.name !== 'AbortError') {
+      sendToRenderer(requestId, { requestId, error: getErrorMessage(err), done: true });
     } else {
       sendToRenderer(requestId, { requestId, done: true });
     }
@@ -694,10 +728,14 @@ async function readWindowsClipboardImageFromWSL() {
   }
 }
 
-ipcMain.handle('chutes:chat', async (event, { requestId, params }) => {
+ipcMain.handle('chutes:chat', async (event, payload = {}) => {
+  const { requestId, params } = payload || {};
   try {
     assertTrustedSender(event);
     const win = BrowserWindow.fromWebContents(event.sender);
+    if (!win) throw new Error('Unable to resolve renderer window.');
+    if (typeof requestId !== 'string' || !requestId) throw new Error('Invalid request id.');
+    if (!params || typeof params !== 'object') throw new Error('Invalid chat params.');
     streamingWindows.set(requestId, win);
 
     const t = await getTransport();
@@ -705,6 +743,7 @@ ipcMain.handle('chutes:chat', async (event, { requestId, params }) => {
     activeControllers.set(requestId, abort);
 
     if (params.stream) {
+      if (!response.body) throw new Error('Streaming response body is missing.');
       pumpSSE(requestId, response.body, sendToRenderer, cleanupRequest);
       return { ok: true, stream: true };
     }
@@ -714,17 +753,20 @@ ipcMain.handle('chutes:chat', async (event, { requestId, params }) => {
     return { ok: true, stream: false, body };
   } catch (err) {
     cleanupRequest(requestId);
-    return { ok: false, error: err.message };
+    return { ok: false, error: getErrorMessage(err) };
   }
 });
 
-ipcMain.handle('chutes:abort', (event, { requestId }) => {
+ipcMain.handle('chutes:abort', (event, payload = {}) => {
   try {
     assertTrustedSender(event);
+    const { requestId } = payload || {};
+    if (typeof requestId !== 'string' || !requestId) throw new Error('Invalid request id.');
     activeControllers.get(requestId)?.();
     cleanupRequest(requestId);
-  } catch {
-    return;
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: getErrorMessage(err) };
   }
 });
 
@@ -735,13 +777,14 @@ ipcMain.handle('chutes:models', async (event) => {
     const metadata = await t.getModelMetadata();
     return { ok: true, models: metadata.map((entry) => entry.id), metadata };
   } catch (err) {
-    return { ok: false, error: err.message };
+    return { ok: false, error: getErrorMessage(err) };
   }
 });
 
-ipcMain.handle('chutes:webSearch', async (event, { query }) => {
+ipcMain.handle('chutes:webSearch', async (event, payload = {}) => {
   try {
     assertTrustedSender(event);
+    const { query } = payload || {};
     const normalizedQuery = typeof query === 'string' ? query.trim() : '';
     if (!normalizedQuery) {
       return { ok: false, error: 'Search query is required.' };
@@ -766,7 +809,7 @@ ipcMain.handle('chutes:webSearch', async (event, { query }) => {
     const results = parseDuckDuckGoResults(html).slice(0, 5);
     return { ok: true, results, fetchedAt: new Date().toISOString(), provider: 'DuckDuckGo' };
   } catch (err) {
-    return { ok: false, error: err.message };
+    return { ok: false, error: getErrorMessage(err) };
   }
 });
 
@@ -776,7 +819,7 @@ ipcMain.handle('chutes:modelStats', async (event) => {
     const stats = await fetchModelStats();
     return { ok: true, stats };
   } catch (err) {
-    return { ok: false, error: err.message };
+    return { ok: false, error: getErrorMessage(err) };
   }
 });
 
@@ -807,13 +850,14 @@ ipcMain.handle('chutes:clipboardImage', async (event) => {
       ...windowsImage,
     };
   } catch (err) {
-    return { ok: false, error: err.message };
+    return { ok: false, error: getErrorMessage(err) };
   }
 });
 
-ipcMain.handle('settings:saveApiKey', async (event, { provider, apiKey }) => {
+ipcMain.handle('settings:saveApiKey', async (event, payload = {}) => {
   try {
     assertTrustedSender(event);
+    const { provider, apiKey } = payload || {};
     assertSupportedProvider(provider);
     const normalizedApiKey = normalizeApiKey(apiKey);
     const creds = await loadCredentials();
@@ -822,23 +866,25 @@ ipcMain.handle('settings:saveApiKey', async (event, { provider, apiKey }) => {
     setApiKey(normalizedApiKey);
     return { ok: true, ...(await getApiKeyStatus()) };
   } catch (err) {
-    return { ok: false, error: err.message };
+    return { ok: false, error: getErrorMessage(err) };
   }
 });
 
-ipcMain.handle('settings:getApiKeyStatus', async (event, { provider }) => {
+ipcMain.handle('settings:getApiKeyStatus', async (event, payload = {}) => {
   try {
     assertTrustedSender(event);
+    const { provider } = payload || {};
     assertSupportedProvider(provider);
     return { ok: true, ...(await getApiKeyStatus()) };
   } catch (err) {
-    return { ok: false, error: err.message };
+    return { ok: false, error: getErrorMessage(err) };
   }
 });
 
-ipcMain.handle('settings:deleteApiKey', async (event, { provider }) => {
+ipcMain.handle('settings:deleteApiKey', async (event, payload = {}) => {
   try {
     assertTrustedSender(event);
+    const { provider } = payload || {};
     assertSupportedProvider(provider);
     const creds = await loadCredentials();
     delete creds.chutesApiKey;
@@ -850,6 +896,6 @@ ipcMain.handle('settings:deleteApiKey', async (event, { provider }) => {
     setApiKey('');
     return { ok: true, ...(await getApiKeyStatus()) };
   } catch (err) {
-    return { ok: false, error: err.message };
+    return { ok: false, error: getErrorMessage(err) };
   }
 });

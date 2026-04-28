@@ -68,8 +68,8 @@ import {
 } from '@/lib/ai/chutesTransport';
 import { cn } from '@/lib/utils';
 import type {
-  Message as DisplayMessage,
   MessageAttachment,
+  MessageMemory,
   MessageStatus,
 } from '@/lib/types';
 
@@ -109,14 +109,14 @@ const EMPTY_API_KEY_STATUS: ApiKeyStatus = {
   canPersist: true,
 };
 
-const WELCOME_MESSAGE: DisplayMessage = {
+const WELCOME_MESSAGE = {
   role: 'assistant',
   content:
     'Welcome to Chutes E2EE Chat. Your messages are encrypted end-to-end using ML-KEM-768 + ChaCha20-Poly1305. Only the TEE GPU instance can decrypt your prompts.\n\nI learn from every conversation. Click the brain icon to see what I remember. I also handle hiccups automatically so we never lose momentum.',
 };
 
 export default function ChatPage() {
-  const [displayMessages, setDisplayMessages] = useState<DisplayMessage[]>([WELCOME_MESSAGE]);
+  const [, bumpMemoryRevision] = useState(0);
   const [input, setInput] = useState('');
   const [attachments, setAttachments] = useState<MessageAttachment[]>([]);
   const [webSearchEnabled, setWebSearchEnabled] = useState(true);
@@ -181,6 +181,10 @@ export default function ChatPage() {
     }),
     [],
   );
+
+  const refreshMemoryUi = useCallback(() => {
+    bumpMemoryRevision((revision) => revision + 1);
+  }, []);
 
   const chat = useChat<ChutesUIMessage>({
     transport: chatTransport,
@@ -253,7 +257,12 @@ export default function ChatPage() {
         return;
       }
 
-      const result = await window.chutes.webSearch(query);
+      let result: Awaited<ReturnType<typeof window.chutes.webSearch>>;
+      try {
+        result = await window.chutes.webSearch(query);
+      } catch (err: any) {
+        result = { ok: false, error: err?.message || 'Web search failed.' };
+      }
       addToolOutputRef.current?.({
         tool: 'web_search',
         toolCallId: toolCall.toolCallId,
@@ -302,19 +311,6 @@ export default function ChatPage() {
   }, [addToolOutput]);
 
   useEffect(() => {
-    setDisplayMessages([
-      WELCOME_MESSAGE,
-      ...aiMessages.map((message, index) =>
-        uiMessageToDisplayMessage(message, {
-          isLast: index === aiMessages.length - 1,
-          status: aiStatus,
-          error: aiError,
-        }),
-      ),
-    ]);
-  }, [aiMessages, aiStatus, aiError]);
-
-  useEffect(() => {
     const loading = aiStatus === 'submitted' || aiStatus === 'streaming';
     setIsLoading(loading);
 
@@ -360,8 +356,8 @@ export default function ChatPage() {
   }, [setModel]);
 
   const applyApiKeyStatus = useCallback((res: any) => {
-    if (!res.ok) {
-      setApiKeyError(res.error || 'Could not read API key status.');
+    if (!res?.ok) {
+      setApiKeyError(res?.error || 'Could not read API key status.');
       return;
     }
 
@@ -391,18 +387,23 @@ export default function ChatPage() {
 
   useEffect(() => {
     if (typeof window === 'undefined' || !window.chutes) return;
-    window.chutes.models().then((res: any) => {
-      if (res.ok && res.models && res.models.length > 0) {
-        setModels(res.models.filter((m: string) => m.includes('TEE')));
-      }
-      if (res.ok && res.metadata) {
-        setModelMetadata(
-          Object.fromEntries(
-            res.metadata.map((entry: ChutesModelMetadata) => [entry.id, entry]),
-          ),
-        );
-      }
-    });
+    window.chutes.models()
+      .then((res: any) => {
+        if (res.ok && res.models && res.models.length > 0) {
+          const teeModels = res.models.filter((m: string) => m.includes('TEE'));
+          if (teeModels.length > 0) setModels(teeModels);
+        }
+        if (res.ok && res.metadata) {
+          setModelMetadata(
+            Object.fromEntries(
+              res.metadata.map((entry: ChutesModelMetadata) => [entry.id, entry]),
+            ),
+          );
+        }
+      })
+      .catch(() => {
+        setModels(FALLBACK_MODELS);
+      });
   }, []);
 
   useEffect(() => {
@@ -444,7 +445,11 @@ export default function ChatPage() {
 
   useEffect(() => {
     if (typeof window === 'undefined' || !window.chutes) return;
-    window.chutes.getApiKeyStatus('chutes').then(applyApiKeyStatus);
+    window.chutes.getApiKeyStatus('chutes')
+      .then(applyApiKeyStatus)
+      .catch((err) => {
+        setApiKeyError(err?.message || 'Could not read API key status.');
+      });
   }, [applyApiKeyStatus]);
 
   useEffect(() => {
@@ -538,12 +543,13 @@ export default function ChatPage() {
 
   const sendMessage = useCallback(async () => {
     const attachmentSnapshot = attachments;
+    const inputSnapshot = input;
     const enteredText = input.trim();
     const text = enteredText || (attachmentSnapshot.length > 0 ? 'Please review the attached file(s).' : '');
     if ((!text && attachmentSnapshot.length === 0) || isLoading) return;
 
     const { entries: recalledEntries, contextBlock: memoryContext } = memoryStoreRef.current.recallFor(text);
-    const memoryForUI: DisplayMessage['memoryContext'] = recalledEntries.map((m) => ({
+    const memoryForUI: MessageMemory[] = recalledEntries.map((m) => ({
       source: 'recalled',
       label: m.label,
       content: m.content,
@@ -578,6 +584,10 @@ export default function ChatPage() {
         { body: config },
       );
     } catch (err: any) {
+      setInput(inputSnapshot);
+      setAttachments(attachmentSnapshot);
+      setIsLoading(false);
+      setStreamStage('idle');
       setCurrentStatus({
         done: true,
         action: 'error',
@@ -605,42 +615,50 @@ export default function ChatPage() {
   const addFiles = useCallback(async (files: File[]) => {
     if (files.length === 0) return;
 
-    const nextAttachments = await Promise.all(
-      files.map(async (file, index): Promise<MessageAttachment> => {
-        const fallbackName = file.type.startsWith('image/')
-          ? `pasted-screenshot-${Date.now()}-${index + 1}.${extensionForMimeType(file.type)}`
-          : `pasted-file-${Date.now()}-${index + 1}`;
-        const base = {
-          id: crypto.randomUUID(),
-          name: file.name || fallbackName,
-          mimeType: file.type || 'application/octet-stream',
-          size: file.size,
-        };
-
-        if (file.type.startsWith('image/')) {
-          return {
-            ...base,
-            kind: 'image',
-            dataUrl: await readFileAsDataUrl(file),
+    try {
+      const nextAttachments = await Promise.all(
+        files.map(async (file, index): Promise<MessageAttachment> => {
+          const fallbackName = file.type.startsWith('image/')
+            ? `pasted-screenshot-${Date.now()}-${index + 1}.${extensionForMimeType(file.type)}`
+            : `pasted-file-${Date.now()}-${index + 1}`;
+          const base = {
+            id: crypto.randomUUID(),
+            name: file.name || fallbackName,
+            mimeType: file.type || 'application/octet-stream',
+            size: file.size,
           };
-        }
 
-        if (isTextFile(file)) {
-          const text = await readFileAsText(file);
-          return {
-            ...base,
-            kind: 'text',
-            text: text.slice(0, 120_000),
-          };
-        }
+          if (file.type.startsWith('image/')) {
+            return {
+              ...base,
+              kind: 'image',
+              dataUrl: await readFileAsDataUrl(file),
+            };
+          }
 
-        return { ...base, kind: 'unsupported' };
-      }),
-    );
+          if (isTextFile(file)) {
+            const text = await readFileAsText(file);
+            return {
+              ...base,
+              kind: 'text',
+              text: text.slice(0, 120_000),
+            };
+          }
 
-    setAttachments((prev) => [...prev, ...nextAttachments]);
-    setClipboardStatus(null);
-    if (fileInputRef.current) fileInputRef.current.value = '';
+          return { ...base, kind: 'unsupported' };
+        }),
+      );
+
+      setAttachments((prev) => [...prev, ...nextAttachments]);
+      setClipboardStatus(null);
+    } catch (err: any) {
+      setClipboardStatus({
+        level: 'error',
+        message: err?.message || 'Could not read the selected file.',
+      });
+    } finally {
+      if (fileInputRef.current) fileInputRef.current.value = '';
+    }
   }, []);
 
   const handleFiles = useCallback((files: FileList | null) => {
@@ -649,7 +667,14 @@ export default function ChatPage() {
   }, [addFiles]);
 
   const addNativeClipboardImage = useCallback(async () => {
-    const result = await window.chutes.clipboardImage();
+    let result: Awaited<ReturnType<typeof window.chutes.clipboardImage>>;
+    try {
+      result = await window.chutes.clipboardImage();
+    } catch (err: any) {
+      setClipboardStatus({ level: 'error', message: err?.message || 'Could not read clipboard.' });
+      return false;
+    }
+
     if (!result.ok) {
       setClipboardStatus({ level: 'error', message: result.error || 'Could not read clipboard.' });
       return false;
@@ -814,24 +839,32 @@ export default function ChatPage() {
   const saveKey = async () => {
     if (!apiKey.trim()) return;
     setApiKeyError('');
-    const res = await window.chutes.saveApiKey('chutes', apiKey.trim());
-    if (res.ok) {
-      applyApiKeyStatus(res);
-      setShowSettings(false);
-      setApiKey('');
-    } else {
-      setApiKeyError(res.error || 'Could not save API key.');
+    try {
+      const res = await window.chutes.saveApiKey('chutes', apiKey.trim());
+      if (res.ok) {
+        applyApiKeyStatus(res);
+        setShowSettings(false);
+        setApiKey('');
+      } else {
+        setApiKeyError(res.error || 'Could not save API key.');
+      }
+    } catch (err: any) {
+      setApiKeyError(err?.message || 'Could not save API key.');
     }
   };
 
   const deleteKey = async () => {
     setApiKeyError('');
-    const res = await window.chutes.deleteApiKey('chutes');
-    if (res.ok) {
-      applyApiKeyStatus(res);
-      setApiKey('');
-    } else {
-      setApiKeyError(res.error || 'Could not delete API key.');
+    try {
+      const res = await window.chutes.deleteApiKey('chutes');
+      if (res.ok) {
+        applyApiKeyStatus(res);
+        setApiKey('');
+      } else {
+        setApiKeyError(res.error || 'Could not delete API key.');
+      }
+    } catch (err: any) {
+      setApiKeyError(err?.message || 'Could not delete API key.');
     }
   };
 
@@ -1035,7 +1068,7 @@ export default function ChatPage() {
           onSave={saveKey}
           onDelete={deleteKey}
           memoryStore={memoryStoreRef.current}
-          onMemoryStateChange={() => setDisplayMessages((prev) => [...prev])}
+          onMemoryStateChange={refreshMemoryUi}
         />
       )}
 
@@ -1044,7 +1077,7 @@ export default function ChatPage() {
           <MemoryPanel
             store={memoryStoreRef.current}
             onClose={() => setShowMemoryPanel(false)}
-            onStateChange={() => setDisplayMessages((prev) => [...prev])}
+            onStateChange={refreshMemoryUi}
           />
         </div>
       )}
@@ -1215,9 +1248,6 @@ function AssistantMessage({
         {metadata?.memoryContext && metadata.memoryContext.length > 0 && (
           <MemoryRecallFencing
             memories={metadata.memoryContext.map((mc) => ({ label: mc.label, content: mc.content }))}
-            onClose={() => {
-              /* memory edits live in the brain panel */
-            }}
           />
         )}
 
@@ -1733,38 +1763,6 @@ function toolPartsToStatusHistory(toolParts: ReturnType<typeof collectToolParts>
     timestamp: Date.now(),
     level: part.state === 'output-error' ? 'error' : part.state?.startsWith('output') ? 'success' : 'info',
   }));
-}
-
-function uiMessageToDisplayMessage(
-  message: ChutesUIMessage,
-  {
-    isLast,
-    status,
-    error,
-  }: {
-    isLast: boolean;
-    status: string;
-    error?: Error;
-  },
-): DisplayMessage {
-  const text = collectText(message.parts);
-  const reasoning = collectReasoning(message.parts);
-  const toolStatuses = toolPartsToStatusHistory(collectToolParts(message.parts));
-  const isLoading = isLast && (status === 'submitted' || status === 'streaming');
-  const isError = isLast && status === 'error' && message.role === 'assistant';
-
-  return {
-    id: message.id,
-    role: message.role === 'assistant' ? 'assistant' : 'user',
-    content: isError && !text ? (error?.message || 'Something went wrong.') : text,
-    reasoning: reasoning || undefined,
-    attachments: message.metadata?.attachments,
-    memoryContext: message.metadata?.memoryContext,
-    statusHistory: toolStatuses.length > 0 ? toolStatuses : undefined,
-    isStreaming: message.role === 'assistant' && isLoading,
-    isError,
-    done: message.role === 'assistant' ? !isLoading : undefined,
-  };
 }
 
 function attachmentsToFileParts(attachments: MessageAttachment[]): FileUIPart[] {
