@@ -186,7 +186,55 @@ export default function ChatPage() {
     transport: chatTransport,
     sendAutomaticallyWhen: lastAssistantMessageIsCompleteWithToolCalls,
     async onToolCall({ toolCall }) {
-      if (toolCall.dynamic || toolCall.toolName !== 'web_search') return;
+      if (toolCall.dynamic) return;
+
+      // ----- Memory tool -----
+      if ((toolCall.toolName as string) === 'memory') {
+        const input = toolCall.input as unknown as {
+          action: string;
+          target: string;
+          content?: string;
+          old_text?: string;
+        };
+        const store = memoryStoreRef.current;
+        const target = (input.target === 'user' ? 'user' : 'memory') as 'memory' | 'user';
+        let result: { success: boolean; error?: string; usage?: string; currentEntries?: string[] };
+
+        if (input.action === 'add') {
+          result = store.add(input.content || '', target);
+        } else if (input.action === 'replace') {
+          result = store.replace(target, input.old_text || '', input.content || '');
+        } else if (input.action === 'remove') {
+          result = store.remove(target, input.old_text || '');
+        } else {
+          result = { success: false, error: `Unknown memory action '${input.action}'.` };
+        }
+
+        addToolOutputRef.current?.({
+          tool: 'memory',
+          toolCallId: toolCall.toolCallId,
+          output: {
+            ok: result.success,
+            tool: 'memory',
+            action: input.action,
+            target,
+            ...(result.success
+              ? {
+                  usage: result.usage,
+                  currentEntries: result.currentEntries,
+                }
+              : { error: result.error }),
+          },
+          options: {
+            metadata: { ...chatConfigRef.current, toolsEnabled: false },
+            body: { ...chatConfigRef.current, toolsEnabled: false },
+          },
+        });
+        return;
+      }
+
+      // ----- Web search tool -----
+      if ((toolCall.toolName as string) !== 'web_search') return;
 
       const input = toolCall.input as { query?: string };
       const query = typeof input?.query === 'string' ? input.query.trim() : '';
