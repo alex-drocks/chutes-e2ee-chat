@@ -8,7 +8,6 @@ export interface Memory {
   content: string;
   createdAt: number;
   updatedAt: number;
-  turnCount: number;
 }
 
 export interface UserProfile {
@@ -65,7 +64,6 @@ export class MemoryStore {
       content,
       createdAt: Date.now(),
       updatedAt: Date.now(),
-      turnCount: 0,
     };
     this.memories.push(mem);
     this.save();
