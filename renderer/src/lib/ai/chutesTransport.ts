@@ -238,9 +238,52 @@ export function buildStandardTools(): ChutesToolDefinition[] {
     {
       type: 'function',
       function: {
+        name: 'memory',
+        description: (
+          'Save, update, or remove durable information to persistent memory that survives across sessions.\n\n' +
+          'WHEN TO SAVE (proactive — do not wait to be asked):\n' +
+          '- User corrects you or says "remember this" / "don\'t do that again"\n' +
+          '- User shares a preference, habit, or personal detail (name, role, coding style)\n' +
+          '- You discover something about the environment (OS, installed tools, project structure)\n' +
+          '- You identify a stable fact that will be useful again in future sessions\n\n' +
+          'PRIORITY: User preferences and corrections > environment facts > procedural knowledge.\n' +
+          'SKIP: trivial info, things easily re-discovered, raw data dumps, and temporary task state.\n\n' +
+          'TWO TARGETS:\n' +
+          '- "user": user profile — name, role, preferences, communication style\n' +
+          '- "memory": your notes — environment facts, project conventions, lessons learned'
+        ),
+        parameters: {
+          type: 'object',
+          properties: {
+            action: {
+              type: 'string',
+              enum: ['add', 'replace', 'remove'],
+              description: 'The action to perform.',
+            },
+            target: {
+              type: 'string',
+              enum: ['memory', 'user'],
+              description: "Which store: 'memory' for agent notes, 'user' for user profile.",
+            },
+            content: {
+              type: 'string',
+              description: "The entry content. Required for 'add' and 'replace'.",
+            },
+            old_text: {
+              type: 'string',
+              description: "Short unique substring identifying the entry to replace or remove.",
+            },
+          },
+          required: ['action', 'target'],
+          additionalProperties: false,
+        },
+      },
+    },
+    {
+      type: 'function',
+      function: {
         name: 'web_search',
-        description:
-          'Search the live web for current or source-backed information. Returns titles, URLs, and snippets.',
+        description: 'Search the live web for current or source-backed information. Returns titles, URLs, and snippets.',
         parameters: {
           type: 'object',
           properties: {
