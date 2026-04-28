@@ -542,11 +542,10 @@ export default function ChatPage() {
     const text = enteredText || (attachmentSnapshot.length > 0 ? 'Please review the attached file(s).' : '');
     if ((!text && attachmentSnapshot.length === 0) || isLoading) return;
 
-    const memoryContext = memoryStoreRef.current.getMemoryContextBlock();
-    const messagesWithMemory = memoryStoreRef.current.getMemories();
-    const memoryForUI: DisplayMessage['memoryContext'] = messagesWithMemory.map((m) => ({
+    const { entries: recalledEntries, contextBlock: memoryContext } = memoryStoreRef.current.recallFor(text);
+    const memoryForUI: DisplayMessage['memoryContext'] = recalledEntries.map((m) => ({
       source: 'recalled',
-      label: m.target === 'user' ? 'User profile' : 'Agent memory',
+      label: m.label,
       content: m.content,
       id: m.id,
     }));
@@ -587,10 +586,17 @@ export default function ChatPage() {
         level: 'error',
       });
     }
-  }, [attachments, getCurrentChatConfig, input, isLoading, sendAiMessage]);
-
-
-
+  }, [
+    attachments,
+    input,
+    isLoading,
+    sendAiMessage,
+    getCurrentChatConfig,
+    setInput,
+    setAttachments,
+    setStreamStage,
+    setCurrentStatus,
+  ]);
 
   const removeAttachment = useCallback((id: string) => {
     setAttachments((prev) => prev.filter((attachment) => attachment.id !== id));
