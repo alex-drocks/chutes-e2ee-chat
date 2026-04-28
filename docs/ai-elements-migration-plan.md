@@ -10,7 +10,7 @@ Pivot the renderer chat surface from the current assistant-ui integration to a d
 - Multi-model `-TEE` support, including the current single-row searchable selector and TPS/TTFT/utilization/instance stats.
 - Existing web search tool behavior, including the one-search continuation guard.
 - Existing attachment path for images and text/code files, with image sending gated by model input modality.
-- Existing memory/nudge/settings behavior unless it blocks the migration.
+- Existing memory/settings behavior unless it blocks the migration.
 
 ## Architecture
 

@@ -57,7 +57,7 @@ import {
 } from '@/components/ai-elements/reasoning';
 import { Sources, type SourceItem } from '@/components/ai-elements/sources';
 import { Tool, ToolContent, ToolHeader } from '@/components/ai-elements/tool';
-import { MemoryNudge, MemoryRecallFencing, type NudgeAction } from '@/components/MemoryNudge';
+import { MemoryRecallFencing } from '@/components/MemoryRecallFencing';
 import { LiveStatusCard, StatusTimeline } from '@/components/StatusTimeline';
 import { MemoryStore } from '@/lib/memoryStore';
 import {
@@ -84,8 +84,6 @@ const FALLBACK_MODELS = [
 
 const MODEL_STORAGE_KEY = 'chutes-e2ee-chat.lastModel';
 const MAX_RETRIES = 2;
-const MEMORY_NUDGE_INTERVAL = 8;
-const SKILL_NUDGE_INTERVAL = 12;
 
 type StreamStage = 'idle' | 'encrypting' | 'connecting' | 'thinking' | 'streaming';
 
@@ -140,7 +138,6 @@ export default function ChatPage() {
   const [apiKeyError, setApiKeyError] = useState('');
   const [clipboardStatus, setClipboardStatus] = useState<ClipboardStatus | null>(null);
   const [currentStatus, setCurrentStatus] = useState<MessageStatus | undefined>();
-  const [nudges, setNudges] = useState<NudgeAction[]>([]);
   const [showMemoryPanel, setShowMemoryPanel] = useState(false);
 
   const inputRef = useRef<HTMLTextAreaElement>(null);
@@ -497,8 +494,6 @@ export default function ChatPage() {
     const text = enteredText || (attachmentSnapshot.length > 0 ? 'Please review the attached file(s).' : '');
     if ((!text && attachmentSnapshot.length === 0) || isLoading) return;
 
-    memoryStoreRef.current.incrementTurnCounters();
-
     const memoryContext = memoryStoreRef.current.getMemoryContextBlock();
     const messagesWithMemory = memoryStoreRef.current.getMemories();
     const memoryForUI: DisplayMessage['memoryContext'] = messagesWithMemory.map((m) => ({
@@ -546,66 +541,8 @@ export default function ChatPage() {
     }
   }, [attachments, getCurrentChatConfig, input, isLoading, sendAiMessage]);
 
-  const computeNudges = useCallback(() => {
-    const store = memoryStoreRef.current;
-    const newNudges: NudgeAction[] = [];
-    const nudgeId = (type: string) => `${type}-${Date.now()}`;
 
-    if (store.shouldNudgeMemory(MEMORY_NUDGE_INTERVAL) && !store.isDismissed('memory-nudge')) {
-      newNudges.push({
-        id: nudgeId('memory'),
-        type: 'save_memory',
-        label: "I've learned some things about you",
-        description: 'Save what I remember to personalize future conversations.',
-        suggestions: ['Save preferences', "Don't ask again"],
-      });
-    }
 
-    if (store.shouldNudgeSkill(SKILL_NUDGE_INTERVAL) && !store.isDismissed('skill-nudge')) {
-      newNudges.push({
-        id: nudgeId('skill'),
-        type: 'create_skill',
-        label: 'Turn this workflow into a reusable skill',
-        description: 'If this was a multi-step task, I can package it so you can reuse it with one command.',
-        suggestions: ['Create skill', 'Not now'],
-      });
-    }
-
-    setNudges(newNudges);
-  }, []);
-
-  useEffect(() => {
-    if (aiStatus === 'ready' && aiMessages.length > 0) computeNudges();
-  }, [aiMessages.length, aiStatus, computeNudges]);
-
-  const handleNudgeAction = useCallback(
-    (nudge: NudgeAction, choice: string) => {
-      const store = memoryStoreRef.current;
-      if (nudge.type === 'save_memory' && choice.includes('Save')) {
-        const userMessages = displayMessages.filter((m) => m.role === 'user');
-        const recentContent = userMessages.slice(-3).map((m) => m.content).join(' ');
-        if (recentContent.includes('prefer') || recentContent.includes('like') || recentContent.includes('always')) {
-          store.addPreference('Prefers detailed, step-by-step responses');
-        }
-        store.addMemory('User prefers detailed explanations with examples', 'memory');
-        store.resetMemoryNudge();
-      }
-      if (nudge.type === 'create_skill' && choice.includes('Create')) {
-        store.addSkill(
-          'General Q&A',
-          'Standard chat with E2EE through Chutes TEE',
-          'Answer the user question using the TEE-encrypted chat pipeline. Be thorough, cite sources when relevant, and respect user preferences from memory.',
-        );
-        store.resetSkillNudge();
-      }
-      setNudges((prev) => prev.filter((n) => n.id !== nudge.id));
-    },
-    [displayMessages],
-  );
-
-  const handleNudgeDismiss = useCallback((id: string) => {
-    setNudges((prev) => prev.filter((n) => n.id !== id));
-  }, []);
 
   const removeAttachment = useCallback((id: string) => {
     setAttachments((prev) => prev.filter((attachment) => attachment.id !== id));
@@ -778,6 +715,14 @@ export default function ChatPage() {
     setCurrentStatus(undefined);
   }, [stopAiMessage]);
 
+  /**
+   * Retry the last assistant message after a failure.
+   *
+   * NOTE: This uses the *current* chat config (model, tools, images) at the
+   * moment retry is clicked. If the user changed the model between the original
+   * request and the retry, the retry will run with the newly selected model.
+   * This is intentional — the user expects the current settings to apply.
+   */
   const retryLastMessage = useCallback(() => {
     retryCountRef.current += 1;
     if (retryCountRef.current > MAX_RETRIES) {
@@ -805,7 +750,6 @@ export default function ChatPage() {
     setAiMessages([]);
     setInput('');
     setAttachments([]);
-    setNudges([]);
     setClipboardStatus(null);
     setCurrentStatus(undefined);
     setStreamStage('idle');
@@ -1089,11 +1033,6 @@ export default function ChatPage() {
         </ConversationContent>
         <ConversationScrollButton />
 
-        {nudges.length > 0 && (
-          <div className="fixed bottom-28 right-5 z-40 w-[min(380px,calc(100vw-2.5rem))]">
-            <MemoryNudge nudges={nudges} onAction={handleNudgeAction} onDismiss={handleNudgeDismiss} />
-          </div>
-        )}
 
         <div className="border-t border-[var(--border)] bg-[var(--bg-secondary)] px-4 py-3">
           <ChatComposer
@@ -1682,14 +1621,22 @@ function collectReasoning(parts: ChutesUIMessage['parts']) {
 function collectToolParts(parts: ChutesUIMessage['parts']) {
   return parts
     .filter((part) => part.type === 'dynamic-tool' || part.type.startsWith('tool-'))
-    .map((part: any) => ({
-      toolCallId: String(part.toolCallId || part.id || crypto.randomUUID()),
-      toolName: String(part.type === 'dynamic-tool' ? part.toolName : part.type.replace(/^tool-/, '')),
-      input: part.input as { query?: string } | undefined,
-      output: part.output,
-      errorText: part.errorText,
-      state: String(part.state || ''),
-    }));
+    .map((part: any) => {
+      const toolCallId = part.toolCallId || part.id;
+      if (!toolCallId) {
+        console.warn('collectToolParts: tool part missing both toolCallId and id — skipping');
+        return null;
+      }
+      return {
+        toolCallId: String(toolCallId),
+        toolName: String(part.type === 'dynamic-tool' ? part.toolName : part.type.replace(/^tool-/, '')),
+        input: part.input as { query?: string } | undefined,
+        output: part.output,
+        errorText: part.errorText,
+        state: String(part.state || ''),
+      };
+    })
+    .filter(Boolean) as any[];
 }
 
 function extractSources(toolParts: ReturnType<typeof collectToolParts>): SourceItem[] {
@@ -1699,9 +1646,20 @@ function extractSources(toolParts: ReturnType<typeof collectToolParts>): SourceI
     if (!Array.isArray(results)) continue;
     for (const result of results) {
       if (typeof result?.url !== 'string') continue;
-      sources.set(result.url, {
-        title: typeof result.title === 'string' ? result.title : result.url,
-        url: result.url,
+
+      // Sanitize URL: reject non-HTTP(S) schemes to prevent javascript: injection
+      let url: string;
+      try {
+        const parsed = new URL(result.url.trim());
+        if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') continue;
+        url = parsed.href;
+      } catch {
+        continue;
+      }
+
+      sources.set(url, {
+        title: typeof result.title === 'string' ? result.title : url,
+        url,
       });
     }
   }
