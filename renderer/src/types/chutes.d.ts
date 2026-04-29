@@ -88,6 +88,7 @@ declare global {
     provider?: string;
     deepSearch?: boolean;
     extractedCount?: number;
+    extractionAttemptedCount?: number;
     totalResults?: number;
     errors?: number;
     error?: string;
