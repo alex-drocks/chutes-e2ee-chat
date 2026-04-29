@@ -67,7 +67,16 @@ export class ChutesChatTransport implements ChatTransport<ChutesUIMessage> {
     metadata,
   }: Parameters<ChatTransport<ChutesUIMessage>['sendMessages']>[0]) {
     const config = resolveChutesChatConfig(this.options.getConfig?.(), metadata, body);
-    const toolsEnabled = config.toolsEnabled !== false;
+    const isToolResultContinuation =
+      messages.length > 0 &&
+      messages[messages.length - 1]!.role === 'assistant' &&
+      messages[messages.length - 1]!.parts?.some(
+        (part: any) =>
+          part.type === 'tool-result' ||
+          (part.type?.startsWith('tool-') && part.state === 'output-available'),
+      );
+
+    const toolsEnabled = config.toolsEnabled !== false && !isToolResultContinuation;
     const requestId = crypto.randomUUID();
     const textId = `text-${requestId}`;
     const reasoningId = `reasoning-${requestId}`;
@@ -84,6 +93,8 @@ export class ChutesChatTransport implements ChatTransport<ChutesUIMessage> {
         const safeEnqueue = (chunk: UIMessageChunk) => {
           if (!closed) controller.enqueue(chunk);
         };
+
+        safeEnqueue({ type: 'start-step' });
 
         const startText = () => {
           if (!textStarted) {
@@ -157,6 +168,8 @@ export class ChutesChatTransport implements ChatTransport<ChutesUIMessage> {
               });
             }
           }
+
+          safeEnqueue({ type: 'finish-step' });
 
           safeEnqueue({
             type: 'finish',
@@ -359,7 +372,12 @@ function readChutesChatConfig(value: unknown): ChutesChatConfig {
 function toChutesMessages(messages: ChutesUIMessage[], config: ChutesChatConfig): ChatApiMessage[] {
   const apiMessages: ChatApiMessage[] = [];
   const hasToolOutputs = hasToolOutputParts(messages);
-  if (config.toolsEnabled !== false) {
+
+  // toolsEnabled is already resolved by sendMessages, which defensively disables
+  // tools on tool-result continuations. Trust that computed value here.
+  const toolsEnabled = config.toolsEnabled !== false;
+
+  if (toolsEnabled) {
     apiMessages.push({
       role: 'system',
       content:
