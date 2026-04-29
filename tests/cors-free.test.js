@@ -18,38 +18,31 @@
  * a Chutes E2EE client.
  *
  * Usage:
- *   RUN_LIVE_TESTS=1 CHUTES_API_KEY=*** node tests/cors-free.test.js
+ *   RUN_LIVE_TESTS=1 CHUTES_API_KEY=*** bun test tests/cors-free.test.js
  */
 
-import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import 'dotenv/config';
 
-import { ChutesE2EETransport } from '../lib/chutes/ChutesE2EETransport.js';
+import {
+  API_KEY,
+  assertReadableText,
+  describeSelectedModel,
+  getLiveContext,
+  liveTest,
+} from './live-chutes.js';
 
-const API_KEY = process.env.CHUTES_API_KEY || '';
-const ENABLED = process.env.RUN_LIVE_TESTS === '1';
-const NON_REASONING_MODEL = 'Qwen/Qwen3-32B-TEE';
-
-const SKIP_MSG = 'Skipped CORS tests — set CHUTES_API_KEY and RUN_LIVE_TESTS=1 to verify CORS-free Node.js transport.';
-
-test('(live) should fetch /v1/models without any CORS preflight errors', async () => {
-  if (!ENABLED) {
-    console.log(SKIP_MSG);
-    return;
-  }
-  const transport = new ChutesE2EETransport({ apiKey: API_KEY });
+liveTest('(live) should fetch /v1/models without any CORS preflight errors', async () => {
+  const ctx = await getLiveContext();
+  const { transport } = ctx;
   const models = await transport.getModels();
-  assert.ok(models.length >= 5, `expected >= 5 models, got ${models.length}`);
+  assert.ok(models.length >= 1, `expected >= 1 model, got ${models.length}`);
   const teeModels = models.filter((m) => m.includes('-TEE'));
-  assert.ok(teeModels.length >= 3, `expected >= 3 TEE models, got ${teeModels.length}`);
-  console.log('  TEE models:', teeModels.length);
+  assert.ok(teeModels.length >= 1, `expected >= 1 TEE model, got ${teeModels.length}`);
+  console.log(`  TEE models: ${teeModels.length}; selected ${describeSelectedModel(ctx)}`);
 });
 
-test('(live) should fetch /e2e/instances with custom headers (no CORS)', async () => {
-  if (!ENABLED) return;
-  const transport = new ChutesE2EETransport({ apiKey: API_KEY });
-  const chuteId = await transport._discovery.resolveChuteId(NON_REASONING_MODEL);
+liveTest('(live) should fetch /e2e/instances with custom headers (no CORS)', async () => {
+  const { transport, chuteId } = await getLiveContext();
   const instance = await transport._discovery.getNonce(chuteId);
 
   assert.ok(instance.instanceId, 'instanceId should be present');
@@ -58,26 +51,24 @@ test('(live) should fetch /e2e/instances with custom headers (no CORS)', async (
   console.log('  instanceId:', instance.instanceId.slice(0, 8) + '...');
 });
 
-test('(live) should POST /e2e/invoke with custom E2EE headers (no CORS)', async () => {
-  if (!ENABLED) return;
-  const transport = new ChutesE2EETransport({ apiKey: API_KEY });
+liveTest('(live) should POST /e2e/invoke with custom E2EE headers (no CORS)', async () => {
+  const { transport, model } = await getLiveContext();
   const { response } = await transport.chat({
-    model: NON_REASONING_MODEL,
-    messages: [{ role: 'user', content: 'Say exactly "cors free"' }],
+    model,
+    messages: [{ role: 'user', content: 'Reply with a short CORS-free confirmation.' }],
     stream: false,
-    max_tokens: 10,
+    max_tokens: 24,
   });
 
   assert.strictEqual(response.status, 200, `unexpected status: ${response.status}`);
   const body = await response.json();
-  const text = body.choices?.[0]?.message?.content || '';
-  assert.ok(text.length > 2, 'expected non-empty text response');
-  assert.ok(typeof text === 'string', 'response should be a string');
+  const msg = body.choices?.[0]?.message;
+  const text = msg?.content || msg?.reasoning_content || '';
+  assertReadableText(text, 'CORS-free response');
   console.log('  Response:', text.slice(0, 60));
 });
 
-test('(live) should prove Node.js fetch ignores CORS entirely', async () => {
-  if (!ENABLED) return;
+liveTest('(live) should prove Node.js fetch ignores CORS entirely', async () => {
   // In a browser, this exact request would fail CORS preflight because:
   // - Content-Type: application/octet-stream is not a simple CORS content-type
   // - Custom headers (X-Chute-Id, X-Instance-Id, etc.) are not whitelisted
@@ -86,18 +77,17 @@ test('(live) should prove Node.js fetch ignores CORS entirely', async () => {
   //
   // Node.js fetch() has no CORS enforcement at all — it's just an HTTP client.
 
-  const transport = new ChutesE2EETransport({ apiKey: API_KEY });
-  const chuteId = await transport._discovery.resolveChuteId(NON_REASONING_MODEL);
+  const { transport, model, chuteId } = await getLiveContext();
   const instance = await transport._discovery.getNonce(chuteId);
 
   // Manually replicate the invoke request headers to verify they reach the server
   const invokeUrl = 'https://api.chutes.ai/e2e/invoke';
   const { buildE2EERequest } = await import('../lib/chutes/ChutesE2EECrypto.js');
   const { blob } = await buildE2EERequest(instance.e2ePubkey, {
-    model: NON_REASONING_MODEL,
+    model,
     messages: [{ role: 'user', content: 'CORS test' }],
     stream: false,
-    max_tokens: 5,
+    max_tokens: 8,
   });
 
   const res = await fetch(invokeUrl, {

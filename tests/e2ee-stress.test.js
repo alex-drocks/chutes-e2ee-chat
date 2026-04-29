@@ -3,12 +3,11 @@
  *
  * Usage:
  *   node tests/e2ee-stress.test.js            # runs pure-crypto regressions only
- *   RUN_LIVE_TESTS=1 CHUTES_API_KEY=*** node tests/e2ee-stress.test.js
+ *   RUN_LIVE_TESTS=1 CHUTES_API_KEY=*** bun test tests/e2ee-stress.test.js
  */
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import 'dotenv/config';
 
 import {
   deriveKey,
@@ -18,19 +17,31 @@ import {
   generateKeyPair,
   encapsulate,
 } from '../lib/chutes/ChutesE2EECrypto.js';
-import { ChutesE2EETransport } from '../lib/chutes/ChutesE2EETransport.js';
+import {
+  assertReadableText,
+  describeSelectedModel,
+  getLiveContext,
+  liveTest,
+} from './live-chutes.js';
 
-const API_KEY = process.env.CHUTES_API_KEY || '';
-const ENABLED = process.env.RUN_LIVE_TESTS === '1';
-const FAST_MODEL = 'Qwen/Qwen3-32B-TEE';
-
-let transport;
-async function getTransport() {
-  if (!transport) {
-    transport = new ChutesE2EETransport({ apiKey: API_KEY });
-    assert.ok((await transport.getModels()).length > 0);
+let liveContext;
+async function getContext() {
+  if (!liveContext) {
+    liveContext = await getLiveContext();
   }
-  return transport;
+  return liveContext;
+}
+
+async function getTransport() {
+  return (await getContext()).transport;
+}
+
+async function getModel() {
+  return (await getContext()).model;
+}
+
+async function getChuteId() {
+  return (await getContext()).chuteId;
 }
 
 // ---------------------------------------------------------------------------
@@ -77,26 +88,24 @@ test('should decrypt to real UTF-8 string, not ASCII codes (v22 regression)', ()
 // Live tests: require CHUTES_API_KEY + RUN_LIVE_TESTS=1
 // ---------------------------------------------------------------------------
 
-test('(live) warmup: initialise shared transport', async () => {
-  if (!ENABLED) {
-    console.log('Skipped stress/regression API tests — set CHUTES_API_KEY and RUN_LIVE_TESTS=1.');
-    return;
-  }
-  await getTransport();
+liveTest('(live) warmup: initialise shared transport', async () => {
+  const ctx = await getContext();
+  assert.ok(ctx.model, 'live context must select a model');
+  console.log(`  Stress tests using ${describeSelectedModel(ctx)}`);
 });
 
 // ---------------------------------------------------------------------------
 // Stress: long prompt (4KB)
 // ---------------------------------------------------------------------------
 
-test('(live) should encrypt and send a 4KB prompt without leaking it', async () => {
-  if (!ENABLED) return;
+liveTest('(live) should encrypt and send a 4KB prompt without leaking it', async () => {
   const t = await getTransport();
-  const chuteId = await t._discovery.resolveChuteId(FAST_MODEL);
+  const chuteId = await getChuteId();
   const inst = await t._discovery.getNonce(chuteId);
+  const model = await getModel();
 
   const longPrompt = 'A'.repeat(4096);
-  const payload = { model: FAST_MODEL, messages: [{ role: 'user', content: longPrompt }] };
+  const payload = { model, messages: [{ role: 'user', content: longPrompt }] };
   const { blob } = await buildE2EERequest(inst.e2ePubkey, payload);
 
   assert.ok(blob.length > 1200, 'blob must still be reasonable size');
@@ -108,14 +117,14 @@ test('(live) should encrypt and send a 4KB prompt without leaking it', async () 
 // Stress: Unicode / emoji payload
 // ---------------------------------------------------------------------------
 
-test('(live) should handle emoji and unicode in prompts', async () => {
-  if (!ENABLED) return;
+liveTest('(live) should handle emoji and unicode in prompts', async () => {
   const t = await getTransport();
-  const chuteId = await t._discovery.resolveChuteId(FAST_MODEL);
+  const chuteId = await getChuteId();
   const inst = await t._discovery.getNonce(chuteId);
+  const model = await getModel();
 
   const prompt = 'Describe 🔐🛡️🚀 in three emoji';
-  const payload = { model: FAST_MODEL, messages: [{ role: 'user', content: prompt }] };
+  const payload = { model, messages: [{ role: 'user', content: prompt }] };
   const { blob } = await buildE2EERequest(inst.e2ePubkey, payload);
 
   assert.ok(blob.length > 1200);
@@ -129,14 +138,14 @@ test('(live) should handle emoji and unicode in prompts', async () => {
 // Stress: special characters and JSON injection
 // ---------------------------------------------------------------------------
 
-test('(live) should handle JSON special characters without breaking payload', async () => {
-  if (!ENABLED) return;
+liveTest('(live) should handle JSON special characters without breaking payload', async () => {
   const t = await getTransport();
-  const chuteId = await t._discovery.resolveChuteId(FAST_MODEL);
+  const chuteId = await getChuteId();
   const inst = await t._discovery.getNonce(chuteId);
+  const model = await getModel();
 
   const prompt = '{"dangerous": "injection", "nested": {"key": "value"}}';
-  const payload = { model: FAST_MODEL, messages: [{ role: 'user', content: prompt }] };
+  const payload = { model, messages: [{ role: 'user', content: prompt }] };
 
   // Must not throw during stringify/encrypt
   const { blob } = await buildE2EERequest(inst.e2ePubkey, payload);
@@ -150,9 +159,9 @@ test('(live) should handle JSON special characters without breaking payload', as
 // Stress: conversation history accumulation
 // ---------------------------------------------------------------------------
 
-test('(live) should handle multi-turn conversation with growing history', async () => {
-  if (!ENABLED) return;
+liveTest('(live) should handle multi-turn conversation with growing history', async () => {
   const t = await getTransport();
+  const model = await getModel();
   const history = [];
   for (let i = 0; i < 3; i++) {
     history.push({ role: 'user', content: `Message ${i + 1}` });
@@ -161,17 +170,17 @@ test('(live) should handle multi-turn conversation with growing history', async 
   history.push({ role: 'user', content: 'What is the last message number? Reply with one digit.' });
 
   const { response } = await t.chat({
-    model: FAST_MODEL,
+    model,
     messages: history,
     stream: false,
-    max_tokens: 10,
+    max_tokens: 18,
   });
 
   assert.strictEqual(response.status, 200);
   const body = await response.json();
-  const text = body.choices?.[0]?.message?.content || '';
-  assert.ok(text.length > 0, `expected non-empty response, got: "${text}"`);
-  assert.ok(/[a-zA-Z\s]{2,}/.test(text), `expected readable text, got: "${text}"`);
+  const msg = body.choices?.[0]?.message;
+  const text = msg?.content || msg?.reasoning_content || '';
+  assertReadableText(text, 'multi-turn response');
 
   console.log(`  5-turn conversation → response: "${text.slice(0, 40)}..." ✅`);
 });
@@ -180,20 +189,21 @@ test('(live) should handle multi-turn conversation with growing history', async 
 // Stress: multiple sequential requests reuse transport
 // ---------------------------------------------------------------------------
 
-test('(live) should support multiple sequential requests on same transport', async () => {
-  if (!ENABLED) return;
+liveTest('(live) should support multiple sequential requests on same transport', async () => {
   const t = await getTransport();
+  const model = await getModel();
   for (let i = 0; i < 3; i++) {
     const { response } = await t.chat({
-      model: FAST_MODEL,
-      messages: [{ role: 'user', content: `Count: ${i + 1}` }],
+      model,
+      messages: [{ role: 'user', content: `Reply with a short word for request ${i + 1}.` }],
       stream: false,
-      max_tokens: 5,
+      max_tokens: 12,
     });
     assert.strictEqual(response.status, 200);
     const body = await response.json();
-    const text = body.choices?.[0]?.message?.content || '';
-    assert.ok(text.length > 0, `request ${i + 1} returned empty text`);
+    const msg = body.choices?.[0]?.message;
+    const text = msg?.content || msg?.reasoning_content || '';
+    assertReadableText(text, `request ${i + 1} response`);
   }
   console.log('  3 sequential requests on shared transport: ✅');
 });
@@ -202,29 +212,33 @@ test('(live) should support multiple sequential requests on same transport', asy
 // Stress: abort streaming mid-flight
 // ---------------------------------------------------------------------------
 
-test('(live) should abort a streaming request mid-flight', async () => {
-  if (!ENABLED) return;
+liveTest('(live) should abort a streaming request mid-flight', async () => {
   const t = await getTransport();
+  const model = await getModel();
   const { response, abort } = await t.chat({
-    model: FAST_MODEL,
-    messages: [{ role: 'user', content: 'Write a very long story about a dragon.' }],
+    model,
+    messages: [{ role: 'user', content: 'Write five concise sentences about encrypted chat.' }],
     stream: true,
-    max_tokens: 500,
+    max_tokens: 120,
   });
 
   assert.strictEqual(response.status, 200);
 
   const reader = response.body.getReader();
   let chunks = 0;
-  for (let i = 0; i < 3; i++) {
-    const { done } = await reader.read();
-    if (done) break;
-    chunks++;
+  try {
+    for (let i = 0; i < 3; i++) {
+      const { done } = await readStreamChunk(reader);
+      if (done) break;
+      chunks++;
+    }
+    abort();
+    assert.ok(chunks >= 1, `expected at least 1 chunk before abort, got ${chunks}`);
+  } finally {
+    await reader.cancel().catch(() => {});
+    reader.releaseLock();
   }
-  reader.releaseLock();
 
-  abort();
-  assert.ok(chunks >= 1, `expected at least 1 chunk before abort, got ${chunks}`);
   console.log(`  Aborted after ${chunks} chunks: ✅`);
 });
 
@@ -243,3 +257,22 @@ test('should never reuse ephemeral keys (ML-KEM forward secrecy)', async () => {
   }
   console.log(`  5 unique encapsulations: ✅`);
 });
+
+function readStreamChunk(reader) {
+  return new Promise((resolve, reject) => {
+    const timeoutId = setTimeout(() => {
+      reject(new Error('Timed out waiting for stream data before abort.'));
+    }, 12_000);
+
+    reader.read().then(
+      (result) => {
+        clearTimeout(timeoutId);
+        resolve(result);
+      },
+      (err) => {
+        clearTimeout(timeoutId);
+        reject(err);
+      },
+    );
+  });
+}

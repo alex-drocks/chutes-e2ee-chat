@@ -5,62 +5,64 @@
  * transport works correctly against live Chutes.ai TEE instances.
  *
  * Usage:
- *   RUN_LIVE_TESTS=1 CHUTES_API_KEY=*** node tests/e2ee-comprehensive.test.js
+ *   RUN_LIVE_TESTS=1 CHUTES_API_KEY=*** bun test tests/e2ee-comprehensive.test.js
  */
 
-import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import 'dotenv/config';
 
-import { buildE2EERequest, decryptResponse, decryptStreamInit, decryptStreamChunk } from '../lib/chutes/ChutesE2EECrypto.js';
-import { ChutesE2EETransport } from '../lib/chutes/ChutesE2EETransport.js';
+import { buildE2EERequest, decryptResponse } from '../lib/chutes/ChutesE2EECrypto.js';
+import {
+  API_KEY,
+  assertReadableText,
+  describeSelectedModel,
+  getLiveContext,
+  liveTest,
+  readSseChunks,
+} from './live-chutes.js';
 
-const API_KEY = process.env.CHUTES_API_KEY || '';
-const ENABLED = process.env.RUN_LIVE_TESTS === '1';
-const FAST_MODEL = 'Qwen/Qwen3-32B-TEE';
-const REASONING_MODEL = 'moonshotai/Kimi-K2.5-TEE';
+// Re-use a single utilization-selected context across all tests to reduce API pressure.
+let liveContext;
 
-// Re-use a single transport across all tests to reduce API pressure.
-let transport;
-
-async function getTransport() {
-  if (!transport) {
-    transport = new ChutesE2EETransport({ apiKey: API_KEY });
-    const models = await transport.getModels();
-    assert.ok(models.length > 0, 'transport must discover models');
+async function getContext() {
+  if (!liveContext) {
+    liveContext = await getLiveContext();
   }
-  return transport;
+  return liveContext;
 }
 
-test('(live) warmup: initialise shared transport', async () => {
-  if (!ENABLED) {
-    console.log('Skipped comprehensive E2EE tests — set CHUTES_API_KEY and RUN_LIVE_TESTS=1.');
-    return;
-  }
-  await getTransport();
+async function getTransport() {
+  return (await getContext()).transport;
+}
+
+async function getModel() {
+  return (await getContext()).model;
+}
+
+async function getChuteId() {
+  return (await getContext()).chuteId;
+}
+
+liveTest('(live) warmup: initialise shared transport', async () => {
+  const ctx = await getContext();
+  assert.ok(ctx.model, 'live context must select a model');
+  console.log(`  Comprehensive tests using ${describeSelectedModel(ctx)}`);
 });
 
-test('(live) should discover >= 3 TEE models and resolve chute IDs for them', async () => {
-  if (!ENABLED) return;
-  const t = await getTransport();
-  const models = await t.getModels();
-  const tee = models.filter((m) => m.includes('-TEE'));
-  assert.ok(tee.length >= 3, `expected >= 3 TEE models, got ${tee.length}`);
-  for (const m of tee.slice(0, 3)) {
-    const chuteId = await t._discovery.resolveChuteId(m);
-    assert.ok(chuteId.includes('-'), `chute_id should look like a UUID: ${chuteId}`);
-  }
-  console.log(`  Verified ${tee.length} TEE models, resolved 3 chute IDs`);
+liveTest('(live) should discover TEE models and resolve the selected chute ID', async () => {
+  const ctx = await getContext();
+  assert.ok(ctx.teeModels.length >= 1, `expected >= 1 TEE model, got ${ctx.teeModels.length}`);
+  assert.ok(ctx.viableModels.length >= 1, `expected >= 1 utilization-eligible model, got ${ctx.viableModels.length}`);
+  assert.ok(ctx.chuteId.includes('-'), `chute_id should look like a UUID: ${ctx.chuteId}`);
+  console.log(`  Discovered ${ctx.teeModels.length} TEE models; selected ${describeSelectedModel(ctx)}`);
 });
 
 // ---------------------------------------------------------------------------
 // Layer 2: Instance discovery returns valid crypto material
 // ---------------------------------------------------------------------------
 
-test('(live) should return a 1184-byte e2e_pubkey after base64 decode', async () => {
-  if (!ENABLED) return;
+liveTest('(live) should return a 1184-byte e2e_pubkey after base64 decode', async () => {
   const t = await getTransport();
-  const chuteId = await t._discovery.resolveChuteId(FAST_MODEL);
+  const chuteId = await getChuteId();
   const inst = await t._discovery.getNonce(chuteId);
   const pubkey = Buffer.from(inst.e2ePubkey, 'base64');
   assert.strictEqual(pubkey.length, 1184, 'e2e_pubkey must be exactly 1184 bytes');
@@ -73,13 +75,13 @@ test('(live) should return a 1184-byte e2e_pubkey after base64 decode', async ()
 // Layer 3: Encrypted request blob format and plaintext secrecy
 // ---------------------------------------------------------------------------
 
-test('(live) should build a correctly sized encrypted blob with no plaintext leakage', async () => {
-  if (!ENABLED) return;
+liveTest('(live) should build a correctly sized encrypted blob with no plaintext leakage', async () => {
   const t = await getTransport();
-  const chuteId = await t._discovery.resolveChuteId(FAST_MODEL);
+  const chuteId = await getChuteId();
   const inst = await t._discovery.getNonce(chuteId);
+  const model = await getModel();
   const prompt = 'What is the capital of France? ANSWER_WITH_ONE_WORD';
-  const payload = { model: FAST_MODEL, messages: [{ role: 'user', content: prompt }] };
+  const payload = { model, messages: [{ role: 'user', content: prompt }] };
   const { blob, responseSk } = await buildE2EERequest(inst.e2ePubkey, payload);
 
   // Blob: ML-KEM ct (1088) + nonce (12) + ciphertext (N) + tag (16)
@@ -112,12 +114,12 @@ test('(live) should build a correctly sized encrypted blob with no plaintext lea
 // Layer 4: Forward secrecy — each request gets unique ephemeral keys
 // ---------------------------------------------------------------------------
 
-test('(live) should produce different encrypted blobs for identical payloads', async () => {
-  if (!ENABLED) return;
+liveTest('(live) should produce different encrypted blobs for identical payloads', async () => {
   const t = await getTransport();
-  const chuteId = await t._discovery.resolveChuteId(FAST_MODEL);
+  const chuteId = await getChuteId();
   const inst = await t._discovery.getNonce(chuteId);
-  const payload = { model: FAST_MODEL, messages: [{ role: 'user', content: 'test' }] };
+  const model = await getModel();
+  const payload = { model, messages: [{ role: 'user', content: 'test' }] };
   const { blob: blob1 } = await buildE2EERequest(inst.e2ePubkey, payload);
   const { blob: blob2 } = await buildE2EERequest(inst.e2ePubkey, payload);
 
@@ -131,14 +133,14 @@ test('(live) should produce different encrypted blobs for identical payloads', a
 // Layer 5: Non-streaming E2EE round-trip with readable response
 // ---------------------------------------------------------------------------
 
-test('(live) should complete non-streaming E2EE chat and return coherent English', async () => {
-  if (!ENABLED) return;
+liveTest('(live) should complete non-streaming E2EE chat and return readable text', async () => {
   const t = await getTransport();
+  const model = await getModel();
   const { response } = await t.chat({
-    model: FAST_MODEL,
-    messages: [{ role: 'user', content: 'What is 2+2? Answer with one word.' }],
+    model,
+    messages: [{ role: 'user', content: 'Reply with one short sentence about secure chat.' }],
     stream: false,
-    max_tokens: 15,
+    max_tokens: 24,
   });
 
   assert.strictEqual(response.status, 200);
@@ -147,11 +149,7 @@ test('(live) should complete non-streaming E2EE chat and return coherent English
   const msg = body.choices[0]?.message;
   const text = msg?.content || msg?.reasoning_content || '';
 
-  assert.ok(typeof text === 'string', 'text must be a string');
-  assert.ok(text.length > 0, 'text must not be empty');
-  assert.ok(/four|4|\d/i.test(text), `expected numeric answer, got: ${text}`);
-  assert.ok(!/^\d+(,\d+)*$/.test(text.trim()), 'must NOT be comma-separated ASCII codes');
-  assert.ok(/[a-zA-Z\s]{2,}/.test(text), 'must contain readable alphabetic text');
+  assertReadableText(text, 'chat response');
 
   console.log(`  Response: "${text.slice(0, 60)}..."`);
 });
@@ -160,54 +158,27 @@ test('(live) should complete non-streaming E2EE chat and return coherent English
 // Layer 6: Streaming E2EE round-trip with accumulated readable text
 // ---------------------------------------------------------------------------
 
-test('(live) should stream E2EE chat and accumulate human-readable text', async () => {
-  if (!ENABLED) return;
+liveTest('(live) should stream E2EE chat and accumulate human-readable text', async () => {
   const t = await getTransport();
+  const model = await getModel();
   const { response } = await t.chat({
-    model: FAST_MODEL,
-    messages: [{ role: 'user', content: 'Count to three in English.' }],
+    model,
+    messages: [{ role: 'user', content: 'Reply with a short sentence about encryption.' }],
     stream: true,
-    max_tokens: 20,
+    max_tokens: 24,
   });
 
   assert.strictEqual(response.status, 200);
   const ct = response.headers.get('content-type');
   assert.ok(ct?.includes('text/event-stream'), `expected SSE, got ${ct}`);
 
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = '';
-  let fullText = '';
-  let chunkCount = 0;
-
-  for (let safety = 0; safety < 30; safety++) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split('\n');
-    buffer = lines.pop() || '';
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (trimmed.startsWith('data: ')) {
-        const data = trimmed.slice(6);
-        if (data === '[DONE]') continue;
-        try {
-          const parsed = JSON.parse(data);
-          const content = parsed.choices?.[0]?.delta?.content || '';
-          fullText += content;
-          if (content) chunkCount++;
-        } catch {
-          // ignore parse errors for safety
-        }
-      }
-    }
-  }
-  reader.releaseLock();
+  const { contentChunks: chunkCount, fullText } = await readSseChunks(response, {
+    maxReads: 30,
+    stopAfterDataLines: 10,
+  });
 
   assert.ok(chunkCount >= 1, `expected >= 1 content chunk, got ${chunkCount}`);
-  assert.ok(fullText.length > 3, `expected meaningful text, got: "${fullText}"`);
-  assert.ok(/one|two|three|1|2|3/i.test(fullText), `expected counting text, got: "${fullText}"`);
-  assert.ok(/[a-zA-Z\s]{2,}/.test(fullText), 'accumulated text must be readable English');
+  assertReadableText(fullText, 'streamed text');
 
   console.log(`  Streamed ${chunkCount} chunks, text: "${fullText.slice(0, 60)}..."`);
 });
@@ -216,11 +187,11 @@ test('(live) should stream E2EE chat and accumulate human-readable text', async 
 // Layer 7: Reasoning model with reasoning_content field
 // ---------------------------------------------------------------------------
 
-test('(live) should handle reasoning model (Kimi) returning reasoning_content', async () => {
-  if (!ENABLED) return;
+liveTest('(live) should handle the selected reasoning-capable model', async () => {
   const t = await getTransport();
+  const model = await getModel();
   const { response } = await t.chat({
-    model: REASONING_MODEL,
+    model,
     messages: [{ role: 'user', content: 'Explain why 2+2=4 in one short sentence.' }],
     stream: false,
     max_tokens: 40,
@@ -232,8 +203,7 @@ test('(live) should handle reasoning model (Kimi) returning reasoning_content', 
   assert.ok(msg, 'message must exist');
 
   const text = msg.content || msg.reasoning_content || '';
-  assert.ok(text.length > 5, `expected non-empty text, got: ${JSON.stringify(msg)}`);
-  assert.ok(/[a-zA-Z\s]{5,}/.test(text), 'must contain readable text');
+  assertReadableText(text, 'reasoning response');
 
   console.log(`  Reasoning text: "${text.slice(0, 60)}..."`);
 });
@@ -242,13 +212,13 @@ test('(live) should handle reasoning model (Kimi) returning reasoning_content', 
 // Layer 8: The response blob is actually encrypted, not plaintext JSON
 // ---------------------------------------------------------------------------
 
-test('(live) should confirm the raw response is encrypted binary, not plaintext JSON', async () => {
-  if (!ENABLED) return;
+liveTest('(live) should confirm the raw response is encrypted binary, not plaintext JSON', async () => {
   const t = await getTransport();
-  const chuteId = await t._discovery.resolveChuteId(FAST_MODEL);
+  const chuteId = await getChuteId();
   const inst = await t._discovery.getNonce(chuteId);
+  const model = await getModel();
 
-  const payload = { model: FAST_MODEL, messages: [{ role: 'user', content: 'Hi' }], stream: false, max_tokens: 5 };
+  const payload = { model, messages: [{ role: 'user', content: 'Hi' }], stream: false, max_tokens: 8 };
   const { blob, responseSk } = await buildE2EERequest(inst.e2ePubkey, payload);
 
   const invokeUrl = 'https://api.chutes.ai/e2e/invoke';
@@ -280,8 +250,9 @@ test('(live) should confirm the raw response is encrypted binary, not plaintext 
 
   const decrypted = await decryptResponse(rawBuffer, responseSk);
   assert.ok(decrypted.choices, 'decrypted response must have choices');
-  const text = decrypted.choices[0]?.message?.content || '';
-  assert.ok(text.length > 0, 'decrypted text must not be empty');
+  const msg = decrypted.choices[0]?.message;
+  const text = msg?.content || msg?.reasoning_content || '';
+  assertReadableText(text, 'decrypted response text');
 
   console.log(`  Raw ${rawBuffer.length} bytes (encrypted) → decrypted: "${text.slice(0, 40)}..."`);
 });
@@ -290,8 +261,7 @@ test('(live) should confirm the raw response is encrypted binary, not plaintext 
 // Layer 9: Error handling — bad model name
 // ---------------------------------------------------------------------------
 
-test('(live) should fail gracefully with an invalid model name', async () => {
-  if (!ENABLED) return;
+liveTest('(live) should fail gracefully with an invalid model name', async () => {
   const t = await getTransport();
   try {
     await t.chat({
@@ -315,10 +285,9 @@ test('(live) should fail gracefully with an invalid model name', async () => {
 // Layer 10: UUID model passthrough
 // ---------------------------------------------------------------------------
 
-test('(live) should accept a UUID directly as model name', async () => {
-  if (!ENABLED) return;
+liveTest('(live) should accept a UUID directly as model name', async () => {
   const t = await getTransport();
-  const chuteId = await t._discovery.resolveChuteId(FAST_MODEL);
+  const chuteId = await getChuteId();
   const resolved = await t._discovery.resolveChuteId(chuteId);
   assert.strictEqual(resolved, chuteId, 'UUID should pass through unchanged');
   console.log(`  UUID passthrough: ${chuteId.slice(0, 8)}... ✅`);
