@@ -19,7 +19,7 @@
     "test": "bun run test:unit && bun run test:live",
     "test:ci": "node --test tests/protocol.regression.test.js tests/crypto.unit.test.js tests/retry.unit.test.js",
     "test:unit": "node --test tests/protocol.regression.test.js tests/crypto.unit.test.js tests/retry.unit.test.js",
-    "test:live": "node --test tests/e2ee-integration.test.js tests/cors-free.test.js tests/e2ee-comprehensive.test.js tests/e2ee-stress.test.js"
+    "test:live": "RUN_LIVE_TESTS=1 node --test tests/e2ee-integration.test.js tests/cors-free.test.js tests/e2ee-comprehensive.test.js tests/e2ee-stress.test.js"
   },
   "trustedDependencies": [
     "electron"
