@@ -107,6 +107,98 @@ function isExternalHttpUrl(value) {
 function getErrorMessage(err) {
   return err instanceof Error ? err.message : String(err || 'Unexpected error');
 }
+// ---------------------------------------------------------------------------
+// URL safety   (SSRF guards)
+// ---------------------------------------------------------------------------
+
+/** Blocked hostnames that resolve to internal/cloud-metadata endpoints. Always enforced. */
+const _BLOCKED_HOSTNAMES = new Set([
+  'metadata.google.internal',
+  'metadata.goog',
+]);
+/** CIDR ranges that should never be reachable from web-search fetches. */
+const _BLOCKED_CIDRS = [
+  '127.0.0.0/8',
+  '10.0.0.0/8',
+  '172.16.0.0/12',
+  '192.168.0.0/16',
+  '169.254.0.0/16',    // Link-local (cloud metadata)
+  '100.64.0.0/10',     // CGNAT / Tailscale / VPN
+  '198.18.0.0/15',     // Benchmark/testing
+];
+
+let _blockSetCache = null;
+function _getBlockedIpSet() {
+  if (_blockSetCache) return _blockSetCache;
+  const { createRequire } = require('node:module');
+  const nodeRequire = createRequire(import.meta.url);
+  try {
+    const { isInSubnet } = nodeRequire('is-in-subnet');
+    _blockSetCache = { isInSubnet };
+  } catch {
+    // Fallback: bitwise IPv4 CIDR match when the optional dep is absent.
+    // Intentionally limited to IPv4; IPv6 literals are handled by regex below.
+    _blockSetCache = {
+      isInSubnet(addr, cidr) {
+        const [net, bits] = cidr.split('/');
+        const mask = parseInt(bits, 10);
+        const a = addr.split('.').map(Number);
+        const n = net.split('.').map(Number);
+        if (a.length !== 4 || n.length !== 4 || Number.isNaN(mask)) return false;
+        const shifts = 32 - mask;
+        const addrInt = (a[0] << 24) | (a[1] << 16) | (a[2] << 8) | a[3];
+        const netInt = (n[0] << 24) | (n[1] << 16) | (n[2] << 8) | n[3];
+        return (addrInt >>> shifts) === (netInt >>> shifts);
+      },
+    };
+  }
+  return _blockSetCache;
+}
+
+function _isPrivateIp(hostname) {
+  const { isInSubnet } = _getBlockedIpSet();
+  for (const cidr of _BLOCKED_CIDRS) {
+    try {
+      if (isInSubnet(hostname, cidr)) return true;
+    } catch { /* malformed CIDR — skip */ }
+  }
+  return false;
+}
+
+/**
+ * Return a reason string if a URL should be blocked; return `null` when safe.
+ * Guards against SSRF (Server-Side Request Forgery) by rejecting private and
+ * link-local addresses before any fetch leaves the main process.
+ */
+function isUrlUnsafe(urlString) {
+  let url;
+  try {
+    url = new URL(urlString);
+  } catch {
+    return 'Invalid URL';
+  }
+
+  const host = (url.hostname || '').toLowerCase().trim();
+  if (!host) return 'Missing hostname';
+
+  // Always-block hostnames (cloud metadata endpoints)
+  if (_BLOCKED_HOSTNAMES.has(host)) {
+    return `Blocked hostname: ${host}`;
+  }
+
+  // Always-block literal IP addresses in private ranges
+  if (_isPrivateIp(host)) {
+    return `Blocked private IP: ${host}`;
+  }
+
+  // Catch-all for IPv6 loopback / link-local and mis-parsed IPv4 reserved ranges.
+  if (/^\[?(::1|fc00:|fe80:|fd00:|169\.254\.|127\.|0\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)\]?/i.test(host)) {
+    return `Blocked private/reserved address: ${host}`;
+  }
+
+  return null;
+}
+
 
 function normalizeApiKey(apiKey) {
   if (typeof apiKey !== 'string') {
@@ -703,6 +795,12 @@ function parseDuckDuckGoLiteResults(html) {
 let webContentCache = new Map();
 
 async function fetchJinaContent(url, timeoutMs = 8000) {
+  // Guard: block URLs targeting private/internal networks (SSRF protection)
+  const unsafeReason = isUrlUnsafe(url);
+  if (unsafeReason) {
+    throw new Error(`Unsafe URL: ${unsafeReason}`);
+  }
+
   const now = Date.now();
   const cached = webContentCache.get(url);
   if (cached && now - cached.loadedAt < WEB_CONTENT_CACHE_TTL_MS) {
