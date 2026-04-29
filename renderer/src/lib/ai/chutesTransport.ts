@@ -73,7 +73,10 @@ export class ChutesChatTransport implements ChatTransport<ChutesUIMessage> {
       messages[messages.length - 1]!.parts?.some(
         (part: any) =>
           part.type === 'tool-result' ||
-          (part.type?.startsWith('tool-') && part.state === 'output-available'),
+          (part.type?.startsWith('tool-') &&
+            (part.state === 'output-available' ||
+             part.state === 'output-error' ||
+             part.state === 'output-denied')),
       );
 
     const toolsEnabled = config.toolsEnabled !== false && !isToolResultContinuation;
