@@ -27,7 +27,7 @@ const chutesAPI = {
   modelStats: () => ipcRenderer.invoke('chutes:modelStats'),
 
   /** Run a lightweight web search from the main process. */
-  webSearch: (query) => ipcRenderer.invoke('chutes:webSearch', { query }),
+  webSearch: (query, deepSearch = false) => ipcRenderer.invoke('chutes:webSearch', { query, deepSearch }),
 
   /** Read a screenshot/image from the native clipboard when paste events do not expose files. */
   clipboardImage: () => ipcRenderer.invoke('chutes:clipboardImage'),
