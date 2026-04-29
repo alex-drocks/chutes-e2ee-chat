@@ -31,6 +31,8 @@ const MODEL_UTILIZATION_CACHE_TTL_MS = 2 * 60 * 1000;
 const MODEL_STATS_LOOKBACK_DAYS = 3;
 const WEB_CONTENT_CACHE_TTL_MS = 5 * 60 * 1000;
 const WEB_CONTENT_MAX_CONCURRENT = 3;
+const WEB_RESPONSE_MAX_BYTES = 5 * 1024 * 1024;   // 5 MB — cap raw HTML from search engine
+const JINA_RESPONSE_MAX_BYTES = 1 * 1024 * 1024;    // 1 MB — cap extracted article text
 
 protocol.registerSchemesAsPrivileged([
   {
@@ -216,6 +218,40 @@ function containsExfiltratedSecret(urlString) {
     return false;
   }
 }
+
+/**
+ * Read a Response body with a hard byte limit.
+ * Throws if the body exceeds `maxBytes` so oversized payloads cannot OOM the
+ * main process or renderer.
+ */
+async function readWithLengthLimit(response, maxBytes, label) {
+  const reader = response.body?.getReader();
+  if (!reader) {
+    const text = await response.text();
+    if (text.length > maxBytes) {
+      throw new Error(`${label} response exceeds ${maxBytes} byte limit.`);
+    }
+    return text;
+  }
+  const chunks = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value?.byteLength || 0;
+      if (total > maxBytes) {
+        throw new Error(`${label} response exceeds ${maxBytes} byte limit.`);
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const decoder = new TextDecoder();
+  return chunks.map((c) => decoder.decode(c, { stream: true })).join('') + decoder.decode();
+}
+
 function normalizeApiKey(apiKey) {
   if (typeof apiKey !== 'string') {
     throw new Error('API key must be a string.');
@@ -835,7 +871,7 @@ async function fetchJinaContent(url, timeoutMs = 8000) {
   if (!res.ok) {
     return null;
   }
-  const text = await res.text();
+  const text = await readWithLengthLimit(res, JINA_RESPONSE_MAX_BYTES, 'jina.ai');
   if (!text || text.length < 20) {
     return null;
   }
@@ -970,12 +1006,17 @@ ipcMain.handle('chutes:models', async (event) => {
 });
 
 ipcMain.handle('chutes:webSearch', async (event, payload = {}) => {
+  const nowIso = new Date().toISOString();
   try {
     assertTrustedSender(event);
     const { query, deepSearch = false } = payload || {};
     const normalizedQuery = typeof query === 'string' ? query.trim() : '';
     if (!normalizedQuery) {
-      return { ok: false, error: 'Search query is required.' };
+      return {
+        ok: false, error: 'Search query is required.', results: [],
+        fetchedAt: nowIso, provider: 'DuckDuckGo', deepSearch: false,
+        extractedCount: 0, totalResults: 0, errors: 0,
+      };
     }
 
     const searchUrl = 'https://lite.duckduckgo.com/lite/';
@@ -994,49 +1035,65 @@ ipcMain.handle('chutes:webSearch', async (event, payload = {}) => {
     });
 
     if (!response.ok) {
-      return { ok: false, error: `Search failed: HTTP ${response.status}` };
-    }
-
-    const html = await response.text();
-    const results = parseDuckDuckGoLiteResults(html).slice(0, 5);
-
-    if (results.length === 0) {
-      return { ok: true, results: [], fetchedAt: new Date().toISOString(), provider: 'DuckDuckGo' };
-    }
-
-    if (deepSearch) {
-      pruneWebContentCache();
-      const limit = Math.min(results.length, WEB_CONTENT_MAX_CONCURRENT);
-      let extractedCount = 0;
-      let errorCount = 0;
-      for (let i = 0; i < limit; i++) {
-        try {
-          const article = await fetchJinaContent(results[i].url, 8000);
-          if (article) {
-            results[i].article = article;
-            extractedCount += 1;
-          }
-        } catch {
-          errorCount += 1;
-          // Leave article absent; optional to include snippet if wanted, but it's
-          // always there naturally.
-        }
-      }
       return {
-        ok: true,
-        results,
-        fetchedAt: new Date().toISOString(),
-        provider: 'DuckDuckGo',
-        deepSearch: true,
-        extractedCount,
-        totalResults: results.length,
-        errors: errorCount,
+        ok: false, error: `Search failed: HTTP ${response.status}`, results: [],
+        fetchedAt: nowIso, provider: 'DuckDuckGo', deepSearch: Boolean(deepSearch),
+        extractedCount: 0, totalResults: 0, errors: 0,
       };
     }
 
-    return { ok: true, results, fetchedAt: new Date().toISOString(), provider: 'DuckDuckGo' };
+    const html = await readWithLengthLimit(response, WEB_RESPONSE_MAX_BYTES, 'DuckDuckGo');
+    const results = parseDuckDuckGoLiteResults(html).slice(0, 5);
+
+    if (results.length === 0) {
+      return {
+        ok: true, results: [], fetchedAt: nowIso, provider: 'DuckDuckGo',
+        deepSearch: false, extractedCount: 0, totalResults: 0, errors: 0,
+      };
+    }
+
+    // Base response fields — every success path carries the same shape
+    const baseResponse = {
+      ok: true,
+      results,
+      fetchedAt: nowIso,
+      provider: 'DuckDuckGo',
+      deepSearch: Boolean(deepSearch),
+      totalResults: results.length,
+    };
+
+    if (!deepSearch) {
+      return { ...baseResponse, extractedCount: 0, errors: 0 };
+    }
+
+    pruneWebContentCache();
+    const limit = Math.min(results.length, WEB_CONTENT_MAX_CONCURRENT);
+    let extractedCount = 0;
+    let errorCount = 0;
+    for (let i = 0; i < limit; i++) {
+      try {
+        // fetchJinaContent already enforces SSRF and secret-exfil guards
+        const article = await fetchJinaContent(results[i].url, 8000);
+        if (article) {
+          results[i].article = article;
+          extractedCount += 1;
+        }
+      } catch (err) {
+        errorCount += 1;
+        // Leave article absent; snippet is always present from DDG
+      }
+    }
+    return {
+      ...baseResponse,
+      extractedCount,
+      errors: errorCount,
+    };
   } catch (err) {
-    return { ok: false, error: getErrorMessage(err) };
+    return {
+      ok: false, error: getErrorMessage(err), results: [],
+      fetchedAt: nowIso, provider: 'DuckDuckGo',
+      deepSearch: false, extractedCount: 0, totalResults: 0, errors: 0,
+    };
   }
 });
 
