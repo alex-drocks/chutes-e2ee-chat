@@ -200,6 +200,22 @@ function isUrlUnsafe(urlString) {
 }
 
 
+
+/** Regex that catches common secret prefixes in URLs (exfiltration prevention). */
+const _SECRET_PREFIX_RE = /\b(sk-[a-zA-Z0-9_-]{10,}|[0-9a-f]{32,}|api[_-]?key\s*=\s*[a-zA-Z0-9_-]{8,}|token\s*=\s*[a-zA-Z0-9_-]{16,}|password\s*=\s*\S{8,}|secret\s*=\s*\S{8,})/i;
+
+/**
+ * Return `true` if a URL's query string or path appears to embed an API key,
+ * token, or password — a common exfiltration vector.
+ */
+function containsExfiltratedSecret(urlString) {
+  try {
+    const decoded = decodeURIComponent(urlString);
+    return _SECRET_PREFIX_RE.test(decoded);
+  } catch {
+    return false;
+  }
+}
 function normalizeApiKey(apiKey) {
   if (typeof apiKey !== 'string') {
     throw new Error('API key must be a string.');
@@ -799,6 +815,11 @@ async function fetchJinaContent(url, timeoutMs = 8000) {
   const unsafeReason = isUrlUnsafe(url);
   if (unsafeReason) {
     throw new Error(`Unsafe URL: ${unsafeReason}`);
+  }
+
+  // Guard: URLs must not appear to embed secrets (exfiltration prevention)
+  if (containsExfiltratedSecret(url)) {
+    throw new Error('Blocked: URL appears to contain an embedded secret/token.');
   }
 
   const now = Date.now();
