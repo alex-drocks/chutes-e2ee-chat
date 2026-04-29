@@ -29,6 +29,8 @@ const CREDENTIALS_AAD = Buffer.from('chutes-e2ee-chat.credentials.v2');
 const MODEL_STATS_CACHE_TTL_MS = 30 * 60 * 1000;
 const MODEL_UTILIZATION_CACHE_TTL_MS = 2 * 60 * 1000;
 const MODEL_STATS_LOOKBACK_DAYS = 3;
+const WEB_CONTENT_CACHE_TTL_MS = 5 * 60 * 1000;
+const WEB_CONTENT_MAX_CONCURRENT = 3;
 
 protocol.registerSchemesAsPrivileged([
   {
@@ -648,21 +650,88 @@ function normalizeDuckDuckGoUrl(value) {
   }
 }
 
-function parseDuckDuckGoResults(html) {
+function parseDuckDuckGoLiteResults(html) {
   const results = [];
-  const resultPattern = /<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>[\s\S]*?<a[^>]+class="result__snippet"[^>]*>([\s\S]*?)<\/a>/g;
-  let match;
+  const seenUrls = new Set();
+  let m;
 
-  while ((match = resultPattern.exec(html)) !== null) {
-    const title = decodeHtmlEntities(match[2]);
-    const url = normalizeDuckDuckGoUrl(match[1]);
-    const snippet = decodeHtmlEntities(match[3]);
-    if (title && url) {
-      results.push({ title, url, snippet });
+  // Pattern 1: href before class (observed structure on lite.duckduckgo.com)
+  const hrefFirst =
+    /<a[^>]*?\bhref\s*=\s*["']([^"']+)["'][^>]*?\bclass\s*=\s*["'](?:[^"']*\s)?result-link(?:\s[^"']*)?["'][^>]*>([\s\S]*?)<\/a>/gi;
+  while ((m = hrefFirst.exec(html)) !== null) {
+    const url = m[1].trim();
+    if (!seenUrls.has(url)) {
+      seenUrls.add(url);
+      results.push({ title: m[2], url, snippet: '' });
     }
   }
 
-  return results;
+  // Pattern 2: class before href (future-proofing)
+  const classFirst =
+    /<a[^>]*?\bclass\s*=\s*["'](?:[^"']*\s)?result-link(?:\s[^"']*)?["'][^>]*?\bhref\s*=\s*["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
+  while ((m = classFirst.exec(html)) !== null) {
+    const url = m[1].trim();
+    if (!seenUrls.has(url)) {
+      seenUrls.add(url);
+      results.push({ title: m[2], url, snippet: '' });
+    }
+  }
+
+  // Collect snippets in document order
+  const snippets = [];
+  const snippetRe =
+    /<td[^>]*?\bclass\s*=\s*["'](?:[^"']*\s)?result-snippet(?:\s[^"']*)?["'][^>]*>([\s\S]*?)<\/td>/gi;
+  while ((m = snippetRe.exec(html)) !== null) {
+    snippets.push(m[1]);
+  }
+
+  // Pair snippets by index
+  for (let i = 0; i < results.length && i < snippets.length; i++) {
+    results[i].snippet = snippets[i];
+  }
+
+  return results
+    .map((r) => ({
+      title: decodeHtmlEntities(r.title),
+      url: normalizeDuckDuckGoUrl(r.url),
+      snippet: decodeHtmlEntities(r.snippet),
+    }))
+    .filter((r) => r.title && r.url);
+}
+
+/** In-memory cache for extracted page content (r.jina.ai results). */
+let webContentCache = new Map();
+
+async function fetchJinaContent(url, timeoutMs = 8000) {
+  const now = Date.now();
+  const cached = webContentCache.get(url);
+  if (cached && now - cached.loadedAt < WEB_CONTENT_CACHE_TTL_MS) {
+    return cached.content;
+  }
+  const jinaUrl = `https://r.jina.ai/http://${encodeURIComponent(url)}`;
+  const res = await fetch(jinaUrl, {
+    signal: AbortSignal.timeout(timeoutMs),
+    headers: { accept: 'text/markdown, text/plain, */*' },
+  });
+  if (!res.ok) {
+    return null;
+  }
+  const text = await res.text();
+  if (!text || text.length < 20) {
+    return null;
+  }
+  webContentCache.set(url, { content: text, loadedAt: now });
+  return text;
+}
+
+/** Clean up stale entries from the web content cache occasionally. */
+function pruneWebContentCache() {
+  const now = Date.now();
+  for (const [key, entry] of webContentCache.entries()) {
+    if (now - entry.loadedAt > WEB_CONTENT_CACHE_TTL_MS) {
+      webContentCache.delete(key);
+    }
+  }
 }
 
 /** Send a chunk/error to the renderer for a given request. */
@@ -784,21 +853,25 @@ ipcMain.handle('chutes:models', async (event) => {
 ipcMain.handle('chutes:webSearch', async (event, payload = {}) => {
   try {
     assertTrustedSender(event);
-    const { query } = payload || {};
+    const { query, deepSearch = false } = payload || {};
     const normalizedQuery = typeof query === 'string' ? query.trim() : '';
     if (!normalizedQuery) {
       return { ok: false, error: 'Search query is required.' };
     }
 
-    const url = new URL('https://duckduckgo.com/html/');
-    url.searchParams.set('q', normalizedQuery);
+    const searchUrl = 'https://lite.duckduckgo.com/lite/';
+    const body = new URLSearchParams();
+    body.append('q', normalizedQuery);
 
-    const response = await fetch(url, {
+    const response = await fetch(searchUrl, {
+      method: 'POST',
       signal: AbortSignal.timeout(12_000),
       headers: {
         accept: 'text/html',
+        'content-type': 'application/x-www-form-urlencoded',
         'user-agent': 'ChutesE2EEChat/1.0',
       },
+      body: body.toString(),
     });
 
     if (!response.ok) {
@@ -806,7 +879,42 @@ ipcMain.handle('chutes:webSearch', async (event, payload = {}) => {
     }
 
     const html = await response.text();
-    const results = parseDuckDuckGoResults(html).slice(0, 5);
+    const results = parseDuckDuckGoLiteResults(html).slice(0, 5);
+
+    if (results.length === 0) {
+      return { ok: true, results: [], fetchedAt: new Date().toISOString(), provider: 'DuckDuckGo' };
+    }
+
+    if (deepSearch) {
+      pruneWebContentCache();
+      const limit = Math.min(results.length, WEB_CONTENT_MAX_CONCURRENT);
+      let extractedCount = 0;
+      let errorCount = 0;
+      for (let i = 0; i < limit; i++) {
+        try {
+          const article = await fetchJinaContent(results[i].url, 8000);
+          if (article) {
+            results[i].article = article;
+            extractedCount += 1;
+          }
+        } catch {
+          errorCount += 1;
+          // Leave article absent; optional to include snippet if wanted, but it's
+          // always there naturally.
+        }
+      }
+      return {
+        ok: true,
+        results,
+        fetchedAt: new Date().toISOString(),
+        provider: 'DuckDuckGo',
+        deepSearch: true,
+        extractedCount,
+        totalResults: results.length,
+        errors: errorCount,
+      };
+    }
+
     return { ok: true, results, fetchedAt: new Date().toISOString(), provider: 'DuckDuckGo' };
   } catch (err) {
     return { ok: false, error: getErrorMessage(err) };

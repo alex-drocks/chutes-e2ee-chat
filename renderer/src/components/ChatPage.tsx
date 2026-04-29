@@ -16,6 +16,7 @@ import {
   KeyRound,
   Loader2,
   Lock,
+  Newspaper,
   Paperclip,
   Plus,
   RotateCcw,
@@ -83,6 +84,7 @@ const FALLBACK_MODELS = [
 ];
 
 const MODEL_STORAGE_KEY = 'chutes-e2ee-chat.lastModel';
+const DEEP_SEARCH_STORAGE_KEY = 'chutes-e2ee-chat.deepSearch';
 const MAX_RETRIES = 2;
 
 type StreamStage = 'idle' | 'encrypting' | 'connecting' | 'thinking' | 'streaming';
@@ -120,6 +122,7 @@ export default function ChatPage() {
   const [input, setInput] = useState('');
   const [attachments, setAttachments] = useState<MessageAttachment[]>([]);
   const [webSearchEnabled, setWebSearchEnabled] = useState(true);
+  const [deepSearchEnabled, setDeepSearchEnabled] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [streamStage, setStreamStage] = useState<StreamStage>('idle');
   const [model, setModelState] = useState(DEFAULT_MODEL);
@@ -259,7 +262,7 @@ export default function ChatPage() {
 
       let result: Awaited<ReturnType<typeof window.chutes.webSearch>>;
       try {
-        result = await window.chutes.webSearch(query);
+        result = await window.chutes.webSearch(query, deepSearchEnabled);
       } catch (err: any) {
         result = { ok: false, error: err?.message || 'Web search failed.' };
       }
@@ -275,6 +278,10 @@ export default function ChatPage() {
                 source: 'live_web_search',
                 provider: result.provider || 'web search',
                 fetchedAt: result.fetchedAt || new Date().toISOString(),
+                deepSearch: result.deepSearch || false,
+                extractedCount: result.extractedCount,
+                totalResults: result.totalResults,
+                errors: result.errors,
                 results: result.results || [],
               },
             }
@@ -384,6 +391,26 @@ export default function ChatPage() {
       /* ignore unavailable storage */
     }
   }, []);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    try {
+      const storedDeepSearch = window.localStorage.getItem(DEEP_SEARCH_STORAGE_KEY);
+      if (storedDeepSearch === 'true') setDeepSearchEnabled(true);
+      if (storedDeepSearch === 'false') setDeepSearchEnabled(false);
+    } catch {
+      /* ignore unavailable storage */
+    }
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    try {
+      window.localStorage.setItem(DEEP_SEARCH_STORAGE_KEY, String(deepSearchEnabled));
+    } catch {
+      /* ignore unavailable storage */
+    }
+  }, [deepSearchEnabled]);
 
   useEffect(() => {
     if (typeof window === 'undefined' || !window.chutes) return;
@@ -1062,8 +1089,10 @@ export default function ChatPage() {
           apiKeySaved={apiKeySaved}
           apiKeyStatus={apiKeyStatus}
           apiKeyError={apiKeyError}
+          deepSearchEnabled={deepSearchEnabled}
           settingsRef={settingsRef}
           onApiKeyChange={setApiKey}
+          onToggleDeepSearch={() => setDeepSearchEnabled((enabled) => !enabled)}
           onClose={() => setShowSettings(false)}
           onSave={saveKey}
           onDelete={deleteKey}
@@ -1128,6 +1157,7 @@ export default function ChatPage() {
             clipboardStatus={clipboardStatus}
             isLoading={isLoading}
             webSearchEnabled={webSearchEnabled}
+            deepSearchEnabled={deepSearchEnabled}
             selectedModelAcceptsImages={selectedModelAcceptsImages}
             inputRef={inputRef}
             fileInputRef={fileInputRef}
@@ -1138,6 +1168,7 @@ export default function ChatPage() {
             onFiles={handleFiles}
             onRemoveAttachment={removeAttachment}
             onToggleWebSearch={() => setWebSearchEnabled((enabled) => !enabled)}
+            onToggleDeepSearch={() => setDeepSearchEnabled((enabled) => !enabled)}
             onAbort={abort}
           />
         </div>
@@ -1319,6 +1350,7 @@ function ChatComposer({
   clipboardStatus,
   isLoading,
   webSearchEnabled,
+  deepSearchEnabled,
   selectedModelAcceptsImages,
   inputRef,
   fileInputRef,
@@ -1329,6 +1361,7 @@ function ChatComposer({
   onFiles,
   onRemoveAttachment,
   onToggleWebSearch,
+  onToggleDeepSearch,
   onAbort,
 }: {
   input: string;
@@ -1336,6 +1369,7 @@ function ChatComposer({
   clipboardStatus: ClipboardStatus | null;
   isLoading: boolean;
   webSearchEnabled: boolean;
+  deepSearchEnabled: boolean;
   selectedModelAcceptsImages: boolean;
   inputRef: React.RefObject<HTMLTextAreaElement | null>;
   fileInputRef: React.RefObject<HTMLInputElement | null>;
@@ -1346,6 +1380,7 @@ function ChatComposer({
   onFiles: (files: FileList | null) => void;
   onRemoveAttachment: (id: string) => void;
   onToggleWebSearch: () => void;
+  onToggleDeepSearch: () => void;
   onAbort: () => void;
 }) {
   const hasImageAttachment = attachments.some((attachment) => attachment.kind === 'image');
@@ -1409,6 +1444,15 @@ function ChatComposer({
           >
             <Search className="h-4 w-4" />
           </PromptInputButton>
+          {webSearchEnabled && (
+            <PromptInputButton
+              onClick={onToggleDeepSearch}
+              active={deepSearchEnabled}
+              title={deepSearchEnabled ? 'Deep search: extracts full page content' : 'Deep search off: only snippets'}
+            >
+              <Newspaper className="h-4 w-4" />
+            </PromptInputButton>
+          )}
           <PromptInputTextarea
             ref={inputRef}
             value={input}
@@ -1434,7 +1478,7 @@ function ChatComposer({
         {isLoading
           ? 'Working... click stop to interrupt and redirect'
           : webSearchEnabled
-            ? 'Web search auto · ML-KEM-768 · ChaCha20-Poly1305 · HKDF-SHA256 - End-to-end encrypted via Chutes.ai TEE'
+            ? `Web search auto · ${deepSearchEnabled ? 'Deep search on' : 'Deep search off'} · ML-KEM-768 · ChaCha20-Poly1305 · HKDF-SHA256 - End-to-end encrypted via Chutes.ai TEE`
             : 'Web search off · ML-KEM-768 · ChaCha20-Poly1305 · HKDF-SHA256 - End-to-end encrypted via Chutes.ai TEE'}
       </p>
     </div>
@@ -1484,9 +1528,11 @@ function SettingsDialog({
   apiKeySaved,
   apiKeyStatus,
   apiKeyError,
+  deepSearchEnabled,
   settingsRef,
   memoryStore,
   onApiKeyChange,
+  onToggleDeepSearch,
   onClose,
   onSave,
   onDelete,
@@ -1496,9 +1542,11 @@ function SettingsDialog({
   apiKeySaved: boolean;
   apiKeyStatus: ApiKeyStatus;
   apiKeyError: string;
+  deepSearchEnabled: boolean;
   settingsRef: React.RefObject<HTMLDivElement | null>;
   memoryStore: MemoryStore;
   onApiKeyChange: (value: string) => void;
+  onToggleDeepSearch: () => void;
   onClose: () => void;
   onSave: () => void;
   onDelete: () => void;
@@ -1557,6 +1605,31 @@ function SettingsDialog({
                 : 'API key stored with local encrypted storage'}
             </p>
           )}
+
+          <div className="flex items-center justify-between rounded-lg bg-[var(--bg-tertiary)] px-3 py-2">
+            <div className="flex items-center gap-2 text-sm text-[var(--text-primary)]">
+              <Newspaper className="h-3.5 w-3.5 text-[var(--accent)]" />
+              Deep Search
+            </div>
+            <button
+              onClick={onToggleDeepSearch}
+              className={cn(
+                'relative h-5 w-9 rounded-full transition-colors',
+                deepSearchEnabled ? 'bg-[var(--accent)]' : 'bg-black/40',
+              )}
+              title="Toggle deep search (extracts full-page content)"
+            >
+              <span
+                className={cn(
+                  'absolute top-0.5 h-4 w-4 rounded-full bg-white transition-transform',
+                  deepSearchEnabled ? 'left-4.5 translate-x-0' : 'left-0.5 translate-x-0',
+                )}
+              />
+            </button>
+          </div>
+          <p className="text-[11px] text-[var(--text-secondary)] opacity-70">
+            When enabled, search results include full-page markdown extracted via r.jina.ai. Slower but richer answers.
+          </p>
 
           <div className="border-t border-[var(--border)] pt-4">
             <h3 className="mb-2 text-sm font-medium text-[var(--text-primary)]">Saved Memory</h3>
