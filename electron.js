@@ -1205,7 +1205,7 @@ ipcMain.handle('chutes:webSearch', async (event, payload = {}) => {
       return {
         ok: false, error: 'Search query is required.', results: [],
         fetchedAt: nowIso, provider: 'DuckDuckGo', deepSearch: false,
-        extractedCount: 0, totalResults: 0, errors: 0,
+        extractedCount: 0, extractionAttemptedCount: 0, totalResults: 0, errors: 0,
       };
     }
 
@@ -1228,7 +1228,7 @@ ipcMain.handle('chutes:webSearch', async (event, payload = {}) => {
       return {
         ok: false, error: `Search failed: HTTP ${response.status}`, results: [],
         fetchedAt: nowIso, provider: 'DuckDuckGo', deepSearch: Boolean(deepSearch),
-        extractedCount: 0, totalResults: 0, errors: 0,
+        extractedCount: 0, extractionAttemptedCount: 0, totalResults: 0, errors: 0,
       };
     }
 
@@ -1238,7 +1238,7 @@ ipcMain.handle('chutes:webSearch', async (event, payload = {}) => {
     if (results.length === 0) {
       return {
         ok: true, results: [], fetchedAt: nowIso, provider: 'DuckDuckGo',
-        deepSearch: false, extractedCount: 0, totalResults: 0, errors: 0,
+        deepSearch: false, extractedCount: 0, extractionAttemptedCount: 0, totalResults: 0, errors: 0,
       };
     }
 
@@ -1253,7 +1253,7 @@ ipcMain.handle('chutes:webSearch', async (event, payload = {}) => {
     };
 
     if (!deepSearch) {
-      return { ...baseResponse, extractedCount: 0, errors: 0 };
+      return { ...baseResponse, extractedCount: 0, extractionAttemptedCount: 0, errors: 0 };
     }
 
     pruneWebContentCache();
@@ -1283,13 +1283,14 @@ ipcMain.handle('chutes:webSearch', async (event, payload = {}) => {
     return {
       ...baseResponse,
       extractedCount,
+      extractionAttemptedCount: limit,
       errors: errorCount,
     };
   } catch (err) {
     return {
       ok: false, error: getErrorMessage(err), results: [],
       fetchedAt: nowIso, provider: 'DuckDuckGo',
-      deepSearch: false, extractedCount: 0, totalResults: 0, errors: 0,
+      deepSearch: false, extractedCount: 0, extractionAttemptedCount: 0, totalResults: 0, errors: 0,
     };
   }
 });

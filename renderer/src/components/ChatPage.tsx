@@ -104,6 +104,30 @@ type ClipboardStatus = {
   message: string;
 };
 
+type WebSearchToolResult = ChutesWebSearchResult & {
+  snippetLabel: string;
+  contentSource: 'full_page_source_material' | 'search_result_snippet';
+  articleLabel?: string;
+};
+
+type WebSearchToolOutput = {
+  ok: true;
+  tool: 'web_search';
+  query: string;
+  source: 'live_web_search';
+  provider: string;
+  fetchedAt: string;
+  mode: 'deep_search' | 'snippet_search';
+  deepSearch: boolean;
+  status: string;
+  guidance: string;
+  extractedCount: number;
+  extractionAttemptedCount: number;
+  totalResults: number;
+  errors: number;
+  results: WebSearchToolResult[];
+};
+
 const EMPTY_API_KEY_STATUS: ApiKeyStatus = {
   hasApiKey: false,
   hasStoredKey: false,
@@ -119,6 +143,45 @@ const WELCOME_MESSAGE = {
 
 function getErrorMessage(err: unknown, fallback: string) {
   return err instanceof Error ? err.message : fallback;
+}
+
+function buildWebSearchToolOutput(query: string, result: ChutesWebSearchResponse): WebSearchToolOutput {
+  const results = result.results || [];
+  const totalResults = result.totalResults ?? results.length;
+  const extractedCount = result.extractedCount ?? results.filter((item) => Boolean(item.article)).length;
+  const extractionAttemptedCount = result.extractionAttemptedCount ?? (result.deepSearch ? Math.min(totalResults, 3) : 0);
+  const errors = result.errors ?? Math.max(extractionAttemptedCount - extractedCount, 0);
+  const deepSearch = Boolean(result.deepSearch);
+  const status = deepSearch
+    ? `Deep search: ${extractedCount}/${extractionAttemptedCount} pages extracted`
+    : `Snippet search: ${totalResults} ${totalResults === 1 ? 'result' : 'results'}`;
+
+  return {
+    ok: true,
+    tool: 'web_search',
+    query,
+    source: 'live_web_search',
+    provider: result.provider || 'web search',
+    fetchedAt: result.fetchedAt || new Date().toISOString(),
+    mode: deepSearch ? 'deep_search' : 'snippet_search',
+    deepSearch,
+    status,
+    guidance: deepSearch
+      ? 'When a result has article content, treat article as full-page source material and prefer it over the snippet. Use snippets only when article is absent.'
+      : 'Only search result snippets were fetched. Do not imply the full page was read unless article content is present.',
+    extractedCount,
+    extractionAttemptedCount,
+    totalResults,
+    errors,
+    results: results.map((item): WebSearchToolResult => ({
+      ...item,
+      snippetLabel: 'Search result snippet',
+      contentSource: item.article ? 'full_page_source_material' : 'search_result_snippet',
+      ...(item.article
+        ? { articleLabel: 'Full-page source material extracted from this search result' }
+        : {}),
+    })),
+  };
 }
 
 export default function ChatPage() {
@@ -277,19 +340,7 @@ export default function ChatPage() {
         toolCallId: toolCall.toolCallId,
         ...(result.ok
           ? {
-              output: {
-                ok: true,
-                tool: 'web_search',
-                query,
-                source: 'live_web_search',
-                provider: result.provider || 'web search',
-                fetchedAt: result.fetchedAt || new Date().toISOString(),
-                deepSearch: result.deepSearch || false,
-                extractedCount: result.extractedCount,
-                totalResults: result.totalResults,
-                errors: result.errors,
-                results: result.results || [],
-              },
+              output: buildWebSearchToolOutput(query, result),
             }
           : {
               state: 'output-error',
@@ -1310,6 +1361,9 @@ function AssistantMessage({
             {part.state === 'output-error' && part.errorText && (
               <ToolContent>{part.errorText}</ToolContent>
             )}
+            {part.toolName === 'web_search' && part.state === 'output-available' && (
+              <WebSearchToolContent output={part.output} />
+            )}
           </Tool>
         ))}
 
@@ -1351,6 +1405,24 @@ function AssistantMessage({
         )}
       </div>
     </AIMessage>
+  );
+}
+
+function WebSearchToolContent({ output }: { output: unknown }) {
+  const summary = getWebSearchSummary(output);
+  if (!summary) return null;
+
+  return (
+    <ToolContent>
+      <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+        <span>{summary.status}</span>
+        <span className="opacity-50">/</span>
+        <span>{summary.resultText}</span>
+      </div>
+      {summary.warning && (
+        <div className="mt-1 text-amber-300/80">{summary.warning}</div>
+      )}
+    </ToolContent>
   );
 }
 
@@ -1833,6 +1905,44 @@ function extractSources(toolParts: ReturnType<typeof collectToolParts>): SourceI
   return Array.from(sources.values());
 }
 
+type WebSearchSummary = {
+  status: string;
+  resultText: string;
+  warning: string;
+};
+
+function getWebSearchSummary(output: unknown): WebSearchSummary | null {
+  if (!output || typeof output !== 'object') return null;
+  const record = output as Record<string, unknown>;
+  if (record.tool !== 'web_search') return null;
+
+  const results = Array.isArray(record.results) ? record.results : [];
+  const totalResults = readToolNumber(record.totalResults, results.length);
+  const extractedCount = readToolNumber(record.extractedCount, 0);
+  const extractionAttemptedCount = readToolNumber(record.extractionAttemptedCount, 0);
+  const errors = readToolNumber(record.errors, 0);
+  const deepSearch = record.deepSearch === true || record.mode === 'deep_search';
+
+  const status = typeof record.status === 'string'
+    ? record.status
+    : deepSearch
+      ? `Deep search: ${extractedCount}/${extractionAttemptedCount} pages extracted`
+      : `Snippet search: ${totalResults} ${totalResults === 1 ? 'result' : 'results'}`;
+
+  return {
+    status,
+    resultText: `${totalResults} ${totalResults === 1 ? 'source' : 'sources'}`,
+    warning: deepSearch && errors > 0
+      ? `${errors} ${errors === 1 ? 'page' : 'pages'} could not be extracted; snippets are still available.`
+      : '',
+  };
+}
+
+function readToolNumber(value: unknown, fallback: number) {
+  const number = Number(value);
+  return Number.isFinite(number) && number >= 0 ? number : fallback;
+}
+
 function toolPartsToStatusHistory(toolParts: ReturnType<typeof collectToolParts>): MessageStatus[] {
   return toolParts.map((part) => ({
     done: part.state === 'output-available' || part.state === 'output-error' || part.state === 'output-denied',
@@ -1841,11 +1951,18 @@ function toolPartsToStatusHistory(toolParts: ReturnType<typeof collectToolParts>
       part.state === 'output-error'
         ? `${part.toolName} failed: ${part.errorText || 'Unknown error'}`
         : part.state?.startsWith('output')
-          ? `${part.toolName} returned a result`
+          ? getToolResultDescription(part)
           : `Calling ${part.toolName}...`,
     timestamp: Date.now(),
     level: part.state === 'output-error' ? 'error' : part.state?.startsWith('output') ? 'success' : 'info',
   }));
+}
+
+function getToolResultDescription(part: ReturnType<typeof collectToolParts>[number]) {
+  if (part.toolName === 'web_search') {
+    return getWebSearchSummary(part.output)?.status || 'web_search returned a result';
+  }
+  return `${part.toolName} returned a result`;
 }
 
 function attachmentsToFileParts(attachments: MessageAttachment[]): FileUIPart[] {
