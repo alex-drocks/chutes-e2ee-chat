@@ -18,7 +18,7 @@ declare global {
       abort: (requestId: string) => Promise<{ ok: boolean; error?: string }>;
       models: () => Promise<{ ok: boolean; models?: string[]; metadata?: ChutesModelMetadata[]; error?: string }>;
       modelStats: () => Promise<{ ok: boolean; stats?: Record<string, ChutesModelStats>; error?: string }>;
-      webSearch: (query: string) => Promise<{ ok: boolean; results?: ChutesWebSearchResult[]; fetchedAt?: string; provider?: string; error?: string }>;
+      webSearch: (query: string, deepSearch?: boolean) => Promise<ChutesWebSearchResponse>;
       clipboardImage: () => Promise<{ ok: boolean; hasImage?: boolean; dataUrl?: string; mimeType?: string; size?: number; source?: string; error?: string }>;
       onStreamChunk: (callback: (payload: { requestId: string; data?: string; done?: boolean }) => void) => () => void;
       onStreamError: (callback: (payload: { requestId: string; error: string }) => void) => () => void;
@@ -78,6 +78,19 @@ declare global {
     title: string;
     url: string;
     snippet: string;
+    article?: string;
+  };
+
+  type ChutesWebSearchResponse = {
+    ok: boolean;
+    results?: ChutesWebSearchResult[];
+    fetchedAt?: string;
+    provider?: string;
+    deepSearch?: boolean;
+    extractedCount?: number;
+    totalResults?: number;
+    errors?: number;
+    error?: string;
   };
 
   type ChutesMessageContentPart =
