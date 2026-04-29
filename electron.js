@@ -106,6 +106,38 @@ function isExternalHttpUrl(value) {
   }
 }
 
+function isWslEnvironment() {
+  return Boolean(process.env.WSL_DISTRO_NAME || process.env.WSL_INTEROP);
+}
+
+async function openExternalUrl(url) {
+  if (!isExternalHttpUrl(url)) return;
+
+  if (isWslEnvironment()) {
+    try {
+      await execFile(
+        'powershell.exe',
+        ['-NoProfile', '-NonInteractive', '-Command', 'Start-Process -FilePath $args[0]', url],
+        { timeout: 4000, windowsHide: true },
+      );
+      return;
+    } catch {
+      try {
+        await execFile('explorer.exe', [url], { timeout: 4000, windowsHide: true });
+      } catch {
+        // Avoid Electron's Linux opener in WSL because it emits xdg-open errors.
+      }
+      return;
+    }
+  }
+
+  try {
+    await shell.openExternal(url);
+  } catch {
+    // External browser launch failures should not disrupt the chat window.
+  }
+}
+
 function getErrorMessage(err) {
   return err instanceof Error ? err.message : String(err || 'Unexpected error');
 }
@@ -494,7 +526,7 @@ function createWindow() {
 
   win.webContents.setWindowOpenHandler(({ url }) => {
     if (isExternalHttpUrl(url)) {
-      shell.openExternal(url).catch(() => {});
+      openExternalUrl(url);
     }
     return { action: 'deny' };
   });
@@ -503,7 +535,7 @@ function createWindow() {
     if (isTrustedRendererUrl(url)) return;
     event.preventDefault();
     if (isExternalHttpUrl(url)) {
-      shell.openExternal(url).catch(() => {});
+      openExternalUrl(url);
     }
   });
 
