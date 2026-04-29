@@ -1,10 +1,13 @@
 /**
  * Stress and regression tests for E2EE transport edge cases.
+ *
+ * Usage:
+ *   node tests/e2ee-stress.test.js            # runs pure-crypto regressions only
+ *   RUN_LIVE_TESTS=1 CHUTES_API_KEY=*** bun test tests/e2ee-stress.test.js
  */
 
-import { describe, it } from 'node:test';
+import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import 'dotenv/config';
 
 import {
   deriveKey,
@@ -14,219 +17,262 @@ import {
   generateKeyPair,
   encapsulate,
 } from '../lib/chutes/ChutesE2EECrypto.js';
-import { ChutesE2EETransport } from '../lib/chutes/ChutesE2EETransport.js';
+import {
+  assertReadableText,
+  describeSelectedModel,
+  getLiveContext,
+  liveTest,
+} from './live-chutes.js';
 
-const API_KEY = process.env.CHUTES_API_KEY;
-const SKIP = !API_KEY;
-const FAST_MODEL = 'Qwen/Qwen3-32B-TEE';
+let liveContext;
+async function getContext() {
+  if (!liveContext) {
+    liveContext = await getLiveContext();
+  }
+  return liveContext;
+}
 
-describe('E2EE Stress & Regression', { skip: SKIP }, () => {
-  // Re-use a single transport to avoid hitting rate limits.
-  let transport;
+async function getTransport() {
+  return (await getContext()).transport;
+}
 
-  it('warmup: initialise shared transport', async () => {
-    transport = new ChutesE2EETransport({ apiKey: API_KEY });
-    assert.ok((await transport.getModels()).length > 0);
+async function getModel() {
+  return (await getContext()).model;
+}
+
+async function getChuteId() {
+  return (await getContext()).chuteId;
+}
+
+// ---------------------------------------------------------------------------
+// Regression: Node.js v22 ArrayBuffer bug in hkdfSync
+// ---------------------------------------------------------------------------
+
+test('should produce a real Buffer from deriveKey (v22 regression)', () => {
+  const key = deriveKey(
+    Buffer.alloc(32, 0xab),
+    Buffer.alloc(1088, 0xcd),
+    Buffer.from('e2e-req-v1')
+  );
+
+  // @stablelib/chacha20poly1305 checks instanceof Uint8Array
+  // Node.js v22+ returns ArrayBuffer from hkdfSync; we wrap in Buffer.from()
+  assert.ok(key instanceof Uint8Array, 'key must pass instanceof Uint8Array');
+  assert.strictEqual(key.length, 32);
+  // Must not throw when passing directly to ChaCha20Poly1305
+  const nonce = Buffer.alloc(12);
+  const { ciphertext, tag } = chachaEncrypt(key, nonce, Buffer.from('test'));
+  assert.ok(ciphertext.length > 0);
+  assert.strictEqual(tag.length, 16);
+});
+
+// ---------------------------------------------------------------------------
+// Regression: Uint8Array.toString('utf-8') comma-separated decimals
+// ---------------------------------------------------------------------------
+
+test('should decrypt to real UTF-8 string, not ASCII codes (v22 regression)', () => {
+  const key = Buffer.alloc(32, 0x11);
+  const nonce = Buffer.alloc(12, 0x22);
+  const plaintext = Buffer.from('End-to-end encryption 🔐');
+
+  const { ciphertext, tag } = chachaEncrypt(key, nonce, plaintext);
+  const decrypted = chachaDecrypt(key, nonce, ciphertext, tag);
+  const str = Buffer.from(decrypted).toString('utf-8');
+
+  assert.strictEqual(str, 'End-to-end encryption 🔐');
+  assert.ok(str.includes('encryption'), 'must contain readable word');
+  assert.ok(!str.includes('69,110,100'), 'must NOT be decimal ASCII codes');
+});
+
+// ---------------------------------------------------------------------------
+// Live tests: require CHUTES_API_KEY + RUN_LIVE_TESTS=1
+// ---------------------------------------------------------------------------
+
+liveTest('(live) warmup: initialise shared transport', async () => {
+  const ctx = await getContext();
+  assert.ok(ctx.model, 'live context must select a model');
+  console.log(`  Stress tests using ${describeSelectedModel(ctx)}`);
+});
+
+// ---------------------------------------------------------------------------
+// Stress: long prompt (4KB)
+// ---------------------------------------------------------------------------
+
+liveTest('(live) should encrypt and send a 4KB prompt without leaking it', async () => {
+  const t = await getTransport();
+  const chuteId = await getChuteId();
+  const inst = await t._discovery.getNonce(chuteId);
+  const model = await getModel();
+
+  const longPrompt = 'A'.repeat(4096);
+  const payload = { model, messages: [{ role: 'user', content: longPrompt }] };
+  const { blob } = await buildE2EERequest(inst.e2ePubkey, payload);
+
+  assert.ok(blob.length > 1200, 'blob must still be reasonable size');
+  assert.ok(!blob.includes(Buffer.from('A'.repeat(100))), 'must not leak long A-run');
+  console.log(`  4KB prompt → blob: ${blob.length} bytes, no leakage: ✅`);
+});
+
+// ---------------------------------------------------------------------------
+// Stress: Unicode / emoji payload
+// ---------------------------------------------------------------------------
+
+liveTest('(live) should handle emoji and unicode in prompts', async () => {
+  const t = await getTransport();
+  const chuteId = await getChuteId();
+  const inst = await t._discovery.getNonce(chuteId);
+  const model = await getModel();
+
+  const prompt = 'Describe 🔐🛡️🚀 in three emoji';
+  const payload = { model, messages: [{ role: 'user', content: prompt }] };
+  const { blob } = await buildE2EERequest(inst.e2ePubkey, payload);
+
+  assert.ok(blob.length > 1200);
+  assert.ok(!blob.includes(Buffer.from('🔐')), 'emoji must not appear in raw blob');
+  assert.ok(!blob.includes(Buffer.from('🚀')), 'emoji must not appear in raw blob');
+
+  console.log(`  Emoji prompt → blob: ${blob.length} bytes, emoji hidden: ✅`);
+});
+
+// ---------------------------------------------------------------------------
+// Stress: special characters and JSON injection
+// ---------------------------------------------------------------------------
+
+liveTest('(live) should handle JSON special characters without breaking payload', async () => {
+  const t = await getTransport();
+  const chuteId = await getChuteId();
+  const inst = await t._discovery.getNonce(chuteId);
+  const model = await getModel();
+
+  const prompt = '{"dangerous": "injection", "nested": {"key": "value"}}';
+  const payload = { model, messages: [{ role: 'user', content: prompt }] };
+
+  // Must not throw during stringify/encrypt
+  const { blob } = await buildE2EERequest(inst.e2ePubkey, payload);
+  assert.ok(blob.length > 1200);
+  assert.ok(!blob.includes(Buffer.from('dangerous')), 'JSON must be encrypted, not plaintext');
+
+  console.log(`  JSON payload → blob: ${blob.length} bytes, escaped safely: ✅`);
+});
+
+// ---------------------------------------------------------------------------
+// Stress: conversation history accumulation
+// ---------------------------------------------------------------------------
+
+liveTest('(live) should handle multi-turn conversation with growing history', async () => {
+  const t = await getTransport();
+  const model = await getModel();
+  const history = [];
+  for (let i = 0; i < 3; i++) {
+    history.push({ role: 'user', content: `Message ${i + 1}` });
+    history.push({ role: 'assistant', content: `Reply ${i + 1}` });
+  }
+  history.push({ role: 'user', content: 'What is the last message number? Reply with one digit.' });
+
+  const { response } = await t.chat({
+    model,
+    messages: history,
+    stream: false,
+    max_tokens: 18,
   });
 
-  // ---------------------------------------------------------------------------
-  // Regression: Node.js v22 ArrayBuffer bug in hkdfSync
-  // ---------------------------------------------------------------------------
+  assert.strictEqual(response.status, 200);
+  const body = await response.json();
+  const msg = body.choices?.[0]?.message;
+  const text = msg?.content || msg?.reasoning_content || '';
+  assertReadableText(text, 'multi-turn response');
 
-  it('should produce a real Buffer from deriveKey (v22 regression)', () => {
-    const key = deriveKey(
-      Buffer.alloc(32, 0xab),
-      Buffer.alloc(1088, 0xcd),
-      Buffer.from('e2e-req-v1')
-    );
+  console.log(`  5-turn conversation → response: "${text.slice(0, 40)}..." ✅`);
+});
 
-    // @stablelib/chacha20poly1305 checks instanceof Uint8Array
-    // Node.js v22+ returns ArrayBuffer from hkdfSync; we wrap in Buffer.from()
-    assert.ok(key instanceof Uint8Array, 'key must pass instanceof Uint8Array');
-    assert.strictEqual(key.length, 32);
-    // Must not throw when passing directly to ChaCha20Poly1305
-    const nonce = Buffer.alloc(12);
-    const { ciphertext, tag } = chachaEncrypt(key, nonce, Buffer.from('test'));
-    assert.ok(ciphertext.length > 0);
-    assert.strictEqual(tag.length, 16);
-  });
+// ---------------------------------------------------------------------------
+// Stress: multiple sequential requests reuse transport
+// ---------------------------------------------------------------------------
 
-  // ---------------------------------------------------------------------------
-  // Regression: Uint8Array.toString('utf-8') comma-separated decimals
-  // ---------------------------------------------------------------------------
-
-  it('should decrypt to real UTF-8 string, not ASCII codes (v22 regression)', () => {
-    const key = Buffer.alloc(32, 0x11);
-    const nonce = Buffer.alloc(12, 0x22);
-    const plaintext = Buffer.from('End-to-end encryption 🔐');
-
-    const { ciphertext, tag } = chachaEncrypt(key, nonce, plaintext);
-    const decrypted = chachaDecrypt(key, nonce, ciphertext, tag);
-    const str = Buffer.from(decrypted).toString('utf-8');
-
-    assert.strictEqual(str, 'End-to-end encryption 🔐');
-    assert.ok(str.includes('encryption'), 'must contain readable word');
-    assert.ok(!str.includes('69,110,100'), 'must NOT be decimal ASCII codes');
-  });
-
-  // ---------------------------------------------------------------------------
-  // Stress: long prompt (4KB)
-  // ---------------------------------------------------------------------------
-
-  it('should encrypt and send a 4KB prompt without leaking it', async () => {
-
-    const chuteId = await transport._discovery.resolveChuteId(FAST_MODEL);
-    const inst = await transport._discovery.getNonce(chuteId);
-
-    const longPrompt = 'A'.repeat(4096);
-    const payload = { model: FAST_MODEL, messages: [{ role: 'user', content: longPrompt }] };
-    const { blob } = await buildE2EERequest(inst.e2ePubkey, payload);
-
-    assert.ok(blob.length > 1200, 'blob must still be reasonable size');
-    // The compressed+encrypted payload must NOT contain the raw 4096 'A's
-    assert.ok(!blob.includes(Buffer.from('A'.repeat(100))), 'must not leak long A-run');
-    console.log(`  4KB prompt → blob: ${blob.length} bytes, no leakage: ✅`);
-  });
-
-  // ---------------------------------------------------------------------------
-  // Stress: Unicode / emoji payload
-  // ---------------------------------------------------------------------------
-
-  it('should handle emoji and unicode in prompts', async () => {
-
-    const chuteId = await transport._discovery.resolveChuteId(FAST_MODEL);
-    const inst = await transport._discovery.getNonce(chuteId);
-
-    const prompt = 'Describe 🔐🛡️🚀 in three emoji';
-    const payload = { model: FAST_MODEL, messages: [{ role: 'user', content: prompt }] };
-    const { blob, responseSk } = await buildE2EERequest(inst.e2ePubkey, payload);
-
-    assert.ok(blob.length > 1200);
-    assert.ok(!blob.includes(Buffer.from('🔐')), 'emoji must not appear in raw blob');
-    assert.ok(!blob.includes(Buffer.from('🚀')), 'emoji must not appear in raw blob');
-
-    console.log(`  Emoji prompt → blob: ${blob.length} bytes, emoji hidden: ✅`);
-  });
-
-  // ---------------------------------------------------------------------------
-  // Stress: special characters and JSON injection
-  // ---------------------------------------------------------------------------
-
-  it('should handle JSON special characters without breaking payload', async () => {
-
-    const chuteId = await transport._discovery.resolveChuteId(FAST_MODEL);
-    const inst = await transport._discovery.getNonce(chuteId);
-
-    const prompt = '{"dangerous": "injection", "nested": {"key": "value"}}';
-    const payload = { model: FAST_MODEL, messages: [{ role: 'user', content: prompt }] };
-
-    // Must not throw during stringify/encrypt
-    const { blob } = await buildE2EERequest(inst.e2ePubkey, payload);
-    assert.ok(blob.length > 1200);
-    assert.ok(!blob.includes(Buffer.from('dangerous')), 'JSON must be encrypted, not plaintext');
-
-    console.log(`  JSON payload → blob: ${blob.length} bytes, escaped safely: ✅`);
-  });
-
-  // ---------------------------------------------------------------------------
-  // Stress: conversation history accumulation
-  // ---------------------------------------------------------------------------
-
-  it('should handle multi-turn conversation with growing history', async () => {
-
-    const history = [];
-    for (let i = 0; i < 3; i++) {
-      history.push({ role: 'user', content: `Message ${i + 1}` });
-      history.push({ role: 'assistant', content: `Reply ${i + 1}` });
-    }
-    history.push({ role: 'user', content: 'What is the last message number? Reply with one digit.' });
-
-    const { response } = await transport.chat({
-      model: FAST_MODEL,
-      messages: history,
+liveTest('(live) should support multiple sequential requests on same transport', async () => {
+  const t = await getTransport();
+  const model = await getModel();
+  for (let i = 0; i < 3; i++) {
+    const { response } = await t.chat({
+      model,
+      messages: [{ role: 'user', content: `Reply with a short word for request ${i + 1}.` }],
       stream: false,
-      max_tokens: 10,
+      max_tokens: 12,
     });
-
     assert.strictEqual(response.status, 200);
     const body = await response.json();
-    const text = body.choices?.[0]?.message?.content || '';
-    assert.ok(text.length > 0, `expected non-empty response, got: "${text}"`);
-    assert.ok(/[a-zA-Z\s]{2,}/.test(text), `expected readable text, got: "${text}"`);
+    const msg = body.choices?.[0]?.message;
+    const text = msg?.content || msg?.reasoning_content || '';
+    assertReadableText(text, `request ${i + 1} response`);
+  }
+  console.log('  3 sequential requests on shared transport: ✅');
+});
 
-    console.log(`  5-turn conversation → response: "${text.slice(0, 40)}..." ✅`);
+// ---------------------------------------------------------------------------
+// Stress: abort streaming mid-flight
+// ---------------------------------------------------------------------------
+
+liveTest('(live) should abort a streaming request mid-flight', async () => {
+  const t = await getTransport();
+  const model = await getModel();
+  const { response, abort } = await t.chat({
+    model,
+    messages: [{ role: 'user', content: 'Write five concise sentences about encrypted chat.' }],
+    stream: true,
+    max_tokens: 120,
   });
 
-  // ---------------------------------------------------------------------------
-  // Stress: multiple sequential requests reuse transport
-  // ---------------------------------------------------------------------------
+  assert.strictEqual(response.status, 200);
 
-  it('should support multiple sequential requests on same transport', async () => {
-
+  const reader = response.body.getReader();
+  let chunks = 0;
+  try {
     for (let i = 0; i < 3; i++) {
-      const { response } = await transport.chat({
-        model: FAST_MODEL,
-        messages: [{ role: 'user', content: `Count: ${i + 1}` }],
-        stream: false,
-        max_tokens: 5,
-      });
-      assert.strictEqual(response.status, 200);
-      const body = await response.json();
-      const text = body.choices?.[0]?.message?.content || '';
-      assert.ok(text.length > 0, `request ${i + 1} returned empty text`);
-    }
-    console.log('  3 sequential requests on shared transport: ✅');
-  });
-
-  // ---------------------------------------------------------------------------
-  // Stress: abort streaming mid-flight
-  // ---------------------------------------------------------------------------
-
-  it('should abort a streaming request mid-flight', async () => {
-
-    const { response, abort } = await transport.chat({
-      model: FAST_MODEL,
-      messages: [{ role: 'user', content: 'Write a very long story about a dragon.' }],
-      stream: true,
-      max_tokens: 500,
-    });
-
-    assert.strictEqual(response.status, 200);
-
-    // Read a few chunks then abort
-    const reader = response.body.getReader();
-    let chunks = 0;
-    for (let i = 0; i < 3; i++) {
-      const { done } = await reader.read();
+      const { done } = await readStreamChunk(reader);
       if (done) break;
       chunks++;
     }
-    reader.releaseLock();
-
-    // Abort should not throw
     abort();
     assert.ok(chunks >= 1, `expected at least 1 chunk before abort, got ${chunks}`);
-    console.log(`  Aborted after ${chunks} chunks: ✅`);
-  });
+  } finally {
+    await reader.cancel().catch(() => {});
+    reader.releaseLock();
+  }
 
-  // ---------------------------------------------------------------------------
-  // Regression: ML-KEM unique encapsulations per call
-  // ---------------------------------------------------------------------------
-
-  it('should never reuse ephemeral keys (ML-KEM forward secrecy)', async () => {
-    const { pk, sk } = await generateKeyPair();
-    const cts = new Set();
-    for (let i = 0; i < 5; i++) {
-      const { ct } = await encapsulate(pk);
-      const hex = ct.toString('hex');
-      assert.ok(!cts.has(hex), `duplicate ciphertext at iteration ${i + 1}`);
-      cts.add(hex);
-    }
-    console.log(`  5 unique encapsulations: ✅`);
-  });
-
+  console.log(`  Aborted after ${chunks} chunks: ✅`);
 });
 
-if (SKIP) {
-  console.log('Skipped stress/regression tests — set CHUTES_API_KEY.');
+// ---------------------------------------------------------------------------
+// Regression: ML-KEM unique encapsulations per call
+// ---------------------------------------------------------------------------
+
+test('should never reuse ephemeral keys (ML-KEM forward secrecy)', async () => {
+  const { pk } = await generateKeyPair();
+  const cts = new Set();
+  for (let i = 0; i < 5; i++) {
+    const { ct } = await encapsulate(pk);
+    const hex = ct.toString('hex');
+    assert.ok(!cts.has(hex), `duplicate ciphertext at iteration ${i + 1}`);
+    cts.add(hex);
+  }
+  console.log(`  5 unique encapsulations: ✅`);
+});
+
+function readStreamChunk(reader) {
+  return new Promise((resolve, reject) => {
+    const timeoutId = setTimeout(() => {
+      reject(new Error('Timed out waiting for stream data before abort.'));
+    }, 12_000);
+
+    reader.read().then(
+      (result) => {
+        clearTimeout(timeoutId);
+        resolve(result);
+      },
+      (err) => {
+        clearTimeout(timeoutId);
+        reject(err);
+      },
+    );
+  });
 }

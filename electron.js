@@ -29,6 +29,9 @@ const CREDENTIALS_AAD = Buffer.from('chutes-e2ee-chat.credentials.v2');
 const MODEL_STATS_CACHE_TTL_MS = 30 * 60 * 1000;
 const MODEL_UTILIZATION_CACHE_TTL_MS = 2 * 60 * 1000;
 const MODEL_STATS_LOOKBACK_DAYS = 3;
+const CHAT_FALLBACK_MAX_ATTEMPTS = 3;
+const CHAT_FALLBACK_MAX_UTILIZATION = 0.9;
+const CHAT_FALLBACK_MAX_RATE_LIMIT_RATIO_5M = 0.25;
 const WEB_CONTENT_CACHE_TTL_MS = 5 * 60 * 1000;
 const WEB_CONTENT_MAX_CONCURRENT = 3;
 const WEB_RESPONSE_MAX_BYTES = 5 * 1024 * 1024;   // 5 MB — cap raw HTML from search engine
@@ -802,6 +805,117 @@ async function fetchModelStats() {
   return mergeModelData(stats, utilization);
 }
 
+function chatParamsNeedImageInput(params) {
+  for (const message of params?.messages || []) {
+    const content = message?.content;
+    if (!Array.isArray(content)) continue;
+    if (content.some((part) => part?.type === 'image_url')) return true;
+  }
+  return false;
+}
+
+function isTransientE2EEError(err) {
+  const status = Number(err?.status);
+  if ([429, 500, 502, 503, 504].includes(status)) return true;
+
+  const message = getErrorMessage(err);
+  return /\b(429|500|502|503|504)\b/.test(message) ||
+    /Bad Gateway|rate limited|temporarily unavailable|capacity|warming up/i.test(message);
+}
+
+function modelFallbackScore(stats) {
+  const activeInstances = finiteNumber(stats?.activeInstanceCount ?? stats?.totalInstanceCount);
+  const utilization = finiteNumber(stats?.utilizationCurrent);
+  const utilization5m = finiteNumber(stats?.utilization5m);
+  const rateLimitRatio5m = finiteNumber(stats?.rateLimitRatio5m);
+  const singleInstancePenalty = activeInstances < 2 ? 0.3 : 0;
+  const activeInstanceBonus = Math.min(activeInstances, 20) * 0.01;
+
+  return utilization +
+    utilization5m * 0.5 +
+    rateLimitRatio5m * 2 +
+    singleInstancePenalty -
+    activeInstanceBonus;
+}
+
+async function getFallbackChatModels(transportInstance, params, failedModels) {
+  const [metadata, statsResult] = await Promise.all([
+    transportInstance.getModelMetadata(),
+    fetchModelStats().catch(() => ({})),
+  ]);
+  const needsImageInput = chatParamsNeedImageInput(params);
+
+  return metadata
+    .filter((entry) => {
+      if (!entry?.id || failedModels.has(entry.id)) return false;
+      if (!entry.confidentialCompute || !entry.id.includes('-TEE')) return false;
+      if (!entry.inputModalities?.includes('text') || !entry.outputModalities?.includes('text')) return false;
+      if (needsImageInput && !entry.inputModalities?.includes('image')) return false;
+
+      const stats = statsResult[entry.id];
+      if (!stats) return true;
+      if (finiteNumber(stats.activeInstanceCount ?? stats.totalInstanceCount) <= 0) return false;
+      if (finiteNumber(stats.utilizationCurrent) >= CHAT_FALLBACK_MAX_UTILIZATION) return false;
+      if (finiteNumber(stats.utilization5m) >= CHAT_FALLBACK_MAX_UTILIZATION) return false;
+      if (finiteNumber(stats.rateLimitRatio5m) >= CHAT_FALLBACK_MAX_RATE_LIMIT_RATIO_5M) return false;
+      return true;
+    })
+    .sort((a, b) => {
+      const aStats = statsResult[a.id];
+      const bStats = statsResult[b.id];
+      const scoreDelta = modelFallbackScore(aStats) - modelFallbackScore(bStats);
+      if (scoreDelta !== 0) return scoreDelta;
+      return a.id.localeCompare(b.id);
+    })
+    .map((entry) => entry.id);
+}
+
+async function clearFailedModelNonceCache(transportInstance, model) {
+  try {
+    const chuteId = await transportInstance._discovery.resolveChuteId(model);
+    transportInstance._discovery.clearNonceCache(chuteId);
+  } catch {
+    transportInstance._discovery.clearNonceCache();
+  }
+}
+
+async function chatWithModelFallback(transportInstance, params) {
+  const originalModel = params.model;
+  const failedModels = new Set();
+  const attemptedModels = [];
+  let lastError = null;
+
+  for (let attempt = 0; attempt < CHAT_FALLBACK_MAX_ATTEMPTS; attempt += 1) {
+    let model = attempt === 0 ? originalModel : null;
+    if (!model) {
+      model = (await getFallbackChatModels(transportInstance, params, failedModels))[0] || null;
+    }
+    if (!model || failedModels.has(model)) break;
+
+    attemptedModels.push(model);
+    try {
+      const result = await transportInstance.chat({ ...params, model });
+      if (model !== originalModel) {
+        console.warn(`  [fallback] ${originalModel} failed; using ${model}`);
+      }
+      return { ...result, modelUsed: model, attemptedModels };
+    } catch (err) {
+      lastError = err;
+      failedModels.add(model);
+      await clearFailedModelNonceCache(transportInstance, model);
+      if (!isTransientE2EEError(err)) throw err;
+    }
+  }
+
+  if (lastError) {
+    const attempted = attemptedModels.length ? ` Tried: ${attemptedModels.join(', ')}.` : '';
+    lastError.message = `${getErrorMessage(lastError)}${attempted}`;
+    throw lastError;
+  }
+
+  throw new Error('No usable TEE model is currently available for E2EE chat.');
+}
+
 function decodeHtmlEntities(value) {
   return String(value || '')
     .replace(/&amp;/g, '&')
@@ -995,18 +1109,18 @@ ipcMain.handle('chutes:chat', async (event, payload = {}) => {
     streamingWindows.set(requestId, win);
 
     const t = await getTransport();
-    const { response, abort } = await t.chat(params);
+    const { response, abort, modelUsed } = await chatWithModelFallback(t, params);
     activeControllers.set(requestId, abort);
 
     if (params.stream) {
       if (!response.body) throw new Error('Streaming response body is missing.');
       pumpSSE(requestId, response.body, sendToRenderer, cleanupRequest);
-      return { ok: true, stream: true };
+      return { ok: true, stream: true, modelUsed };
     }
 
     const body = await response.json();
     cleanupRequest(requestId);
-    return { ok: true, stream: false, body };
+    return { ok: true, stream: false, body, modelUsed };
   } catch (err) {
     cleanupRequest(requestId);
     return { ok: false, error: getErrorMessage(err) };
