@@ -14,7 +14,7 @@ declare global {
         max_tokens?: number;
         tools?: ChutesToolDefinition[];
         tool_choice?: 'auto' | 'none' | string | Record<string, unknown>;
-      }) => Promise<{ ok: boolean; stream?: boolean; body?: any; modelUsed?: string; error?: string }>;
+      }) => Promise<{ ok: boolean; stream?: boolean; body?: unknown; modelUsed?: string; error?: string }>;
       abort: (requestId: string) => Promise<{ ok: boolean; error?: string }>;
       models: () => Promise<{ ok: boolean; models?: string[]; metadata?: ChutesModelMetadata[]; error?: string }>;
       modelStats: () => Promise<{ ok: boolean; stats?: Record<string, ChutesModelStats>; error?: string }>;

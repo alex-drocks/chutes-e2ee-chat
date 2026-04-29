@@ -5,8 +5,8 @@ An Electron.js + Next.js + Tailwind chat application using Chutes.ai's end-to-en
 ## Architecture
 
 - **Electron Main Process** — Handles all Chutes E2EE transport (ML-KEM-768, ChaCha20-Poly1305, instance discovery) via Node.js native modules. Zero CORS issues because everything runs server-side in the main process.
-- **Electron Preload** — Secure IPC bridge exposing only `chutes.chat()` and `chutes.abort()` to the renderer.
-- **Next.js Renderer** — Chat UI built with Next.js Pages Router and Tailwind CSS.
+- **Electron Preload** — Secure IPC bridge for chat streaming, model metadata, web search, clipboard images, and encrypted API-key settings.
+- **Next.js Renderer** — Chat UI built with the Next.js App Router and Tailwind CSS.
 
 ## E2EE Protocol
 

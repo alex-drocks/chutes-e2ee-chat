@@ -36,6 +36,7 @@ const WEB_CONTENT_CACHE_TTL_MS = 5 * 60 * 1000;
 const WEB_CONTENT_MAX_CONCURRENT = 3;
 const WEB_RESPONSE_MAX_BYTES = 5 * 1024 * 1024;   // 5 MB — cap raw HTML from search engine
 const JINA_RESPONSE_MAX_BYTES = 1 * 1024 * 1024;    // 1 MB — cap extracted article text
+const MAX_REQUEST_ID_LENGTH = 128;
 
 protocol.registerSchemesAsPrivileged([
   {
@@ -143,6 +144,22 @@ async function openExternalUrl(url) {
 
 function getErrorMessage(err) {
   return err instanceof Error ? err.message : String(err || 'Unexpected error');
+}
+
+function assertRequestId(requestId) {
+  if (typeof requestId !== 'string' || requestId.length === 0) {
+    throw new Error('Invalid request id.');
+  }
+  if (requestId.length > MAX_REQUEST_ID_LENGTH) {
+    throw new Error('Request id is too long.');
+  }
+  return requestId;
+}
+
+function createAbortError(message = 'Request aborted.') {
+  const err = new Error(message);
+  err.name = 'AbortError';
+  return err;
 }
 // ---------------------------------------------------------------------------
 // URL safety   (SSRF guards)
@@ -254,6 +271,29 @@ function containsExfiltratedSecret(urlString) {
   }
 }
 
+function normalizeSafeExternalHttpUrl(value) {
+  if (!isExternalHttpUrl(value)) {
+    throw new Error('URL must use http or https.');
+  }
+
+  const url = new URL(value);
+  if (url.username || url.password) {
+    throw new Error('Blocked URL credentials.');
+  }
+
+  const normalized = url.href;
+  const unsafeReason = isUrlUnsafe(normalized);
+  if (unsafeReason) {
+    throw new Error(`Unsafe URL: ${unsafeReason}`);
+  }
+
+  if (containsExfiltratedSecret(normalized)) {
+    throw new Error('Blocked: URL appears to contain an embedded secret/token.');
+  }
+
+  return normalized;
+}
+
 /**
  * Read a Response body with a hard byte limit.
  * Throws if the body exceeds `maxBytes` so oversized payloads cannot OOM the
@@ -263,7 +303,7 @@ async function readWithLengthLimit(response, maxBytes, label) {
   const reader = response.body?.getReader();
   if (!reader) {
     const text = await response.text();
-    if (text.length > maxBytes) {
+    if (Buffer.byteLength(text, 'utf8') > maxBytes) {
       throw new Error(`${label} response exceeds ${maxBytes} byte limit.`);
     }
     return text;
@@ -283,8 +323,7 @@ async function readWithLengthLimit(response, maxBytes, label) {
   } finally {
     reader.releaseLock();
   }
-  const decoder = new TextDecoder();
-  return chunks.map((c) => decoder.decode(c, { stream: true })).join('') + decoder.decode();
+  return new TextDecoder().decode(Buffer.concat(chunks.map((chunk) => Buffer.from(chunk))));
 }
 
 function normalizeApiKey(apiKey) {
@@ -879,13 +918,15 @@ async function clearFailedModelNonceCache(transportInstance, model) {
   }
 }
 
-async function chatWithModelFallback(transportInstance, params) {
+async function chatWithModelFallback(transportInstance, params, { signal } = {}) {
   const originalModel = params.model;
   const failedModels = new Set();
   const attemptedModels = [];
   let lastError = null;
 
   for (let attempt = 0; attempt < CHAT_FALLBACK_MAX_ATTEMPTS; attempt += 1) {
+    if (signal?.aborted) throw createAbortError();
+
     let model = attempt === 0 ? originalModel : null;
     if (!model) {
       model = (await getFallbackChatModels(transportInstance, params, failedModels))[0] || null;
@@ -894,7 +935,7 @@ async function chatWithModelFallback(transportInstance, params) {
 
     attemptedModels.push(model);
     try {
-      const result = await transportInstance.chat({ ...params, model });
+      const result = await transportInstance.chat({ ...params, model }, { signal });
       if (model !== originalModel) {
         console.warn(`  [fallback] ${originalModel} failed; using ${model}`);
       }
@@ -986,30 +1027,28 @@ function parseDuckDuckGoLiteResults(html) {
       url: normalizeDuckDuckGoUrl(r.url),
       snippet: decodeHtmlEntities(r.snippet),
     }))
-    .filter((r) => r.title && r.url);
+    .map((r) => {
+      try {
+        return { ...r, url: normalizeSafeExternalHttpUrl(r.url) };
+      } catch {
+        return null;
+      }
+    })
+    .filter(Boolean);
 }
 
 /** In-memory cache for extracted page content (r.jina.ai results). */
 let webContentCache = new Map();
 
 async function fetchJinaContent(url, timeoutMs = 8000) {
-  // Guard: block URLs targeting private/internal networks (SSRF protection)
-  const unsafeReason = isUrlUnsafe(url);
-  if (unsafeReason) {
-    throw new Error(`Unsafe URL: ${unsafeReason}`);
-  }
-
-  // Guard: URLs must not appear to embed secrets (exfiltration prevention)
-  if (containsExfiltratedSecret(url)) {
-    throw new Error('Blocked: URL appears to contain an embedded secret/token.');
-  }
+  const safeUrl = normalizeSafeExternalHttpUrl(url);
 
   const now = Date.now();
-  const cached = webContentCache.get(url);
+  const cached = webContentCache.get(safeUrl);
   if (cached && now - cached.loadedAt < WEB_CONTENT_CACHE_TTL_MS) {
     return cached.content;
   }
-  const jinaUrl = `https://r.jina.ai/http://${encodeURIComponent(url)}`;
+  const jinaUrl = `https://r.jina.ai/http://${encodeURIComponent(safeUrl)}`;
   const res = await fetch(jinaUrl, {
     signal: AbortSignal.timeout(timeoutMs),
     headers: { accept: 'text/markdown, text/plain, */*' },
@@ -1021,7 +1060,7 @@ async function fetchJinaContent(url, timeoutMs = 8000) {
   if (!text || text.length < 20) {
     return null;
   }
-  webContentCache.set(url, { content: text, loadedAt: now });
+  webContentCache.set(safeUrl, { content: text, loadedAt: now });
   return text;
 }
 
@@ -1104,12 +1143,17 @@ ipcMain.handle('chutes:chat', async (event, payload = {}) => {
     assertTrustedSender(event);
     const win = BrowserWindow.fromWebContents(event.sender);
     if (!win) throw new Error('Unable to resolve renderer window.');
-    if (typeof requestId !== 'string' || !requestId) throw new Error('Invalid request id.');
+    assertRequestId(requestId);
     if (!params || typeof params !== 'object') throw new Error('Invalid chat params.');
     streamingWindows.set(requestId, win);
 
+    const requestController = new AbortController();
+    activeControllers.set(requestId, () => requestController.abort(createAbortError()));
+
     const t = await getTransport();
-    const { response, abort, modelUsed } = await chatWithModelFallback(t, params);
+    const { response, abort, modelUsed } = await chatWithModelFallback(t, params, {
+      signal: requestController.signal,
+    });
     activeControllers.set(requestId, abort);
 
     if (params.stream) {
@@ -1131,7 +1175,7 @@ ipcMain.handle('chutes:abort', (event, payload = {}) => {
   try {
     assertTrustedSender(event);
     const { requestId } = payload || {};
-    if (typeof requestId !== 'string' || !requestId) throw new Error('Invalid request id.');
+    assertRequestId(requestId);
     activeControllers.get(requestId)?.();
     cleanupRequest(requestId);
     return { ok: true };
@@ -1216,19 +1260,26 @@ ipcMain.handle('chutes:webSearch', async (event, payload = {}) => {
     const limit = Math.min(results.length, WEB_CONTENT_MAX_CONCURRENT);
     let extractedCount = 0;
     let errorCount = 0;
-    for (let i = 0; i < limit; i++) {
-      try {
-        // fetchJinaContent already enforces SSRF and secret-exfil guards
-        const article = await fetchJinaContent(results[i].url, 8000);
-        if (article) {
-          results[i].article = article;
-          extractedCount += 1;
+    const extracted = await Promise.all(
+      results.slice(0, limit).map(async (result, index) => {
+        try {
+          const article = await fetchJinaContent(result.url, 8000);
+          return { index, article };
+        } catch {
+          return { index, error: true };
         }
-      } catch (err) {
+      }),
+    );
+
+    for (const item of extracted) {
+      if (item.article) {
+        results[item.index].article = item.article;
+        extractedCount += 1;
+      } else if (item.error) {
         errorCount += 1;
-        // Leave article absent; snippet is always present from DDG
       }
     }
+
     return {
       ...baseResponse,
       extractedCount,

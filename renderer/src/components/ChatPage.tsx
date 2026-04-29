@@ -117,6 +117,10 @@ const WELCOME_MESSAGE = {
     'Welcome to Chutes E2EE Chat. Your messages are encrypted end-to-end using ML-KEM-768 + ChaCha20-Poly1305. Only the TEE GPU instance can decrypt your prompts.\n\nI learn from every conversation. Click the brain icon to see what I remember. I also handle hiccups automatically so we never lose momentum.',
 };
 
+function getErrorMessage(err: unknown, fallback: string) {
+  return err instanceof Error ? err.message : fallback;
+}
+
 export default function ChatPage() {
   const [, bumpMemoryRevision] = useState(0);
   const [input, setInput] = useState('');
@@ -217,6 +221,8 @@ export default function ChatPage() {
           result = { success: false, error: `Unknown memory action '${input.action}'.` };
         }
 
+        if (result.success) refreshMemoryUi();
+
         addToolOutputRef.current?.({
           tool: 'memory',
           toolCallId: toolCall.toolCallId,
@@ -263,8 +269,8 @@ export default function ChatPage() {
       let result: Awaited<ReturnType<typeof window.chutes.webSearch>>;
       try {
         result = await window.chutes.webSearch(query, deepSearchEnabled);
-      } catch (err: any) {
-        result = { ok: false, error: err?.message || 'Web search failed.' };
+      } catch (err: unknown) {
+        result = { ok: false, error: getErrorMessage(err, 'Web search failed.') };
       }
       addToolOutputRef.current?.({
         tool: 'web_search',
@@ -574,6 +580,8 @@ export default function ChatPage() {
     const enteredText = input.trim();
     const text = enteredText || (attachmentSnapshot.length > 0 ? 'Please review the attached file(s).' : '');
     if ((!text && attachmentSnapshot.length === 0) || isLoading) return;
+    retryCountRef.current = 0;
+    clearAiError();
 
     const { entries: recalledEntries, contextBlock: memoryContext } = memoryStoreRef.current.recallFor(text);
     const memoryForUI: MessageMemory[] = recalledEntries.map((m) => ({
@@ -610,7 +618,7 @@ export default function ChatPage() {
         },
         { body: config },
       );
-    } catch (err: any) {
+    } catch (err: unknown) {
       setInput(inputSnapshot);
       setAttachments(attachmentSnapshot);
       setIsLoading(false);
@@ -618,7 +626,7 @@ export default function ChatPage() {
       setCurrentStatus({
         done: true,
         action: 'error',
-        description: err?.message || 'Unexpected error',
+        description: getErrorMessage(err, 'Unexpected error'),
         timestamp: Date.now(),
         level: 'error',
       });
@@ -629,6 +637,7 @@ export default function ChatPage() {
     isLoading,
     sendAiMessage,
     getCurrentChatConfig,
+    clearAiError,
     setInput,
     setAttachments,
     setStreamStage,
@@ -678,10 +687,10 @@ export default function ChatPage() {
 
       setAttachments((prev) => [...prev, ...nextAttachments]);
       setClipboardStatus(null);
-    } catch (err: any) {
+    } catch (err: unknown) {
       setClipboardStatus({
         level: 'error',
-        message: err?.message || 'Could not read the selected file.',
+        message: getErrorMessage(err, 'Could not read the selected file.'),
       });
     } finally {
       if (fileInputRef.current) fileInputRef.current.value = '';
@@ -697,8 +706,8 @@ export default function ChatPage() {
     let result: Awaited<ReturnType<typeof window.chutes.clipboardImage>>;
     try {
       result = await window.chutes.clipboardImage();
-    } catch (err: any) {
-      setClipboardStatus({ level: 'error', message: err?.message || 'Could not read clipboard.' });
+    } catch (err: unknown) {
+      setClipboardStatus({ level: 'error', message: getErrorMessage(err, 'Could not read clipboard.') });
       return false;
     }
 
@@ -875,8 +884,8 @@ export default function ChatPage() {
       } else {
         setApiKeyError(res.error || 'Could not save API key.');
       }
-    } catch (err: any) {
-      setApiKeyError(err?.message || 'Could not save API key.');
+    } catch (err: unknown) {
+      setApiKeyError(getErrorMessage(err, 'Could not save API key.'));
     }
   };
 
@@ -890,8 +899,8 @@ export default function ChatPage() {
       } else {
         setApiKeyError(res.error || 'Could not delete API key.');
       }
-    } catch (err: any) {
-      setApiKeyError(err?.message || 'Could not delete API key.');
+    } catch (err: unknown) {
+      setApiKeyError(getErrorMessage(err, 'Could not delete API key.'));
     }
   };
 
@@ -930,7 +939,7 @@ export default function ChatPage() {
   };
 
   const modelInputValue = showModelMenu ? modelQuery : model;
-  const modelInputWidth = `${Math.max(modelInputValue.length + 1, 18)}ch`;
+  const modelInputWidth = `${Math.min(Math.max(modelInputValue.length + 1, 18), 48)}ch`;
 
   return (
     <div className="flex h-screen flex-col bg-[radial-gradient(circle_at_top_left,rgba(34,197,94,0.06),transparent_34rem),var(--bg-primary)]">
@@ -1066,6 +1075,7 @@ export default function ChatPage() {
           <button
             onClick={() => setShowSettings(!showSettings)}
             className="relative rounded-lg bg-[var(--bg-tertiary)] p-2 text-[var(--text-secondary)] transition-colors hover:text-[var(--text-primary)]"
+            title="Open settings"
           >
             <Settings className="h-4 w-4" />
             {!apiKeySaved && <span className="absolute -right-0.5 -top-0.5 h-2 w-2 rounded-full bg-red-500" />}
@@ -1554,7 +1564,7 @@ function SettingsDialog({
 }) {
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60">
-      <div ref={settingsRef} className="w-[420px] rounded-2xl border border-[var(--border)] bg-[var(--bg-secondary)] p-6 shadow-2xl">
+      <div ref={settingsRef} className="max-h-[calc(100vh-2rem)] w-[min(420px,calc(100vw-2rem))] overflow-y-auto rounded-lg border border-[var(--border)] bg-[var(--bg-secondary)] p-6 shadow-2xl">
         <div className="mb-4 flex items-center justify-between">
           <h2 className="text-lg font-semibold text-[var(--text-primary)]">Settings</h2>
           <button onClick={onClose} className="text-[var(--text-secondary)] hover:text-white">
@@ -1678,7 +1688,7 @@ function MemoryPanel({
   };
 
   return (
-    <div className="pointer-events-auto flex max-h-[70vh] w-80 flex-col gap-3 overflow-y-auto rounded-2xl border border-[var(--border)] bg-[var(--bg-secondary)] p-4 shadow-2xl animate-in fade-in">
+    <div className="pointer-events-auto flex max-h-[70vh] w-80 flex-col gap-3 overflow-y-auto rounded-lg border border-[var(--border)] bg-[var(--bg-secondary)] p-4 shadow-2xl animate-in fade-in">
       <div className="flex items-center justify-between">
         <h3 className="flex items-center gap-2 text-sm font-semibold text-[var(--text-primary)]">
           <Brain className="h-4 w-4 text-[var(--accent)]" />

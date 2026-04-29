@@ -90,6 +90,7 @@ export class ChutesChatTransport implements ChatTransport<ChutesUIMessage> {
     let closed = false;
     let disposeChunk: (() => void) | undefined;
     let disposeError: (() => void) | undefined;
+    let disposeAbort: (() => void) | undefined;
 
     return new ReadableStream<UIMessageChunk>({
       start(controller) {
@@ -234,9 +235,12 @@ export class ChutesChatTransport implements ChatTransport<ChutesUIMessage> {
           controller.error(new Error(payload.error || 'Chutes stream failed.'));
         });
 
-        abortSignal?.addEventListener('abort', () => {
+        const handleAbort = () => {
           if (!closed) window.chutes.abort(requestId);
-        }, { once: true });
+        };
+
+        abortSignal?.addEventListener('abort', handleAbort, { once: true });
+        disposeAbort = () => abortSignal?.removeEventListener('abort', handleAbort);
 
         window.chutes.chat(requestId, {
           model: config.model || DEFAULT_MODEL,
@@ -260,6 +264,7 @@ export class ChutesChatTransport implements ChatTransport<ChutesUIMessage> {
         function cleanup() {
           disposeChunk?.();
           disposeError?.();
+          disposeAbort?.();
         }
       },
       cancel() {
@@ -268,6 +273,7 @@ export class ChutesChatTransport implements ChatTransport<ChutesUIMessage> {
           window.chutes.abort(requestId);
           disposeChunk?.();
           disposeError?.();
+          disposeAbort?.();
         }
       },
     });
