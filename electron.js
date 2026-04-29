@@ -29,6 +29,10 @@ const CREDENTIALS_AAD = Buffer.from('chutes-e2ee-chat.credentials.v2');
 const MODEL_STATS_CACHE_TTL_MS = 30 * 60 * 1000;
 const MODEL_UTILIZATION_CACHE_TTL_MS = 2 * 60 * 1000;
 const MODEL_STATS_LOOKBACK_DAYS = 3;
+const WEB_CONTENT_CACHE_TTL_MS = 5 * 60 * 1000;
+const WEB_CONTENT_MAX_CONCURRENT = 3;
+const WEB_RESPONSE_MAX_BYTES = 5 * 1024 * 1024;   // 5 MB — cap raw HTML from search engine
+const JINA_RESPONSE_MAX_BYTES = 1 * 1024 * 1024;    // 1 MB — cap extracted article text
 
 protocol.registerSchemesAsPrivileged([
   {
@@ -102,40 +106,150 @@ function isExternalHttpUrl(value) {
   }
 }
 
-function isWslEnvironment() {
-  return Boolean(process.env.WSL_DISTRO_NAME || process.env.WSL_INTEROP);
-}
-
-async function openExternalUrl(url) {
-  if (!isExternalHttpUrl(url)) return;
-
-  if (isWslEnvironment()) {
-    try {
-      await execFile(
-        'powershell.exe',
-        ['-NoProfile', '-NonInteractive', '-Command', 'Start-Process -FilePath $args[0]', url],
-        { timeout: 4000, windowsHide: true },
-      );
-      return;
-    } catch {
-      try {
-        await execFile('explorer.exe', [url], { timeout: 4000, windowsHide: true });
-      } catch {
-        // Avoid Electron's Linux opener in WSL because it emits xdg-open errors.
-      }
-      return;
-    }
-  }
-
-  try {
-    await shell.openExternal(url);
-  } catch {
-    // External browser launch failures should not disrupt the chat window.
-  }
-}
-
 function getErrorMessage(err) {
   return err instanceof Error ? err.message : String(err || 'Unexpected error');
+}
+// ---------------------------------------------------------------------------
+// URL safety   (SSRF guards)
+// ---------------------------------------------------------------------------
+
+/** Blocked hostnames that resolve to internal/cloud-metadata endpoints. Always enforced. */
+const _BLOCKED_HOSTNAMES = new Set([
+  'metadata.google.internal',
+  'metadata.goog',
+]);
+/** CIDR ranges that should never be reachable from web-search fetches. */
+const _BLOCKED_CIDRS = [
+  '127.0.0.0/8',
+  '10.0.0.0/8',
+  '172.16.0.0/12',
+  '192.168.0.0/16',
+  '169.254.0.0/16',    // Link-local (cloud metadata)
+  '100.64.0.0/10',     // CGNAT / Tailscale / VPN
+  '198.18.0.0/15',     // Benchmark/testing
+];
+
+let _blockSetCache = null;
+function _getBlockedIpSet() {
+  if (_blockSetCache) return _blockSetCache;
+  const { createRequire } = require('node:module');
+  const nodeRequire = createRequire(import.meta.url);
+  try {
+    const { isInSubnet } = nodeRequire('is-in-subnet');
+    _blockSetCache = { isInSubnet };
+  } catch {
+    // Fallback: bitwise IPv4 CIDR match when the optional dep is absent.
+    // Intentionally limited to IPv4; IPv6 literals are handled by regex below.
+    _blockSetCache = {
+      isInSubnet(addr, cidr) {
+        const [net, bits] = cidr.split('/');
+        const mask = parseInt(bits, 10);
+        const a = addr.split('.').map(Number);
+        const n = net.split('.').map(Number);
+        if (a.length !== 4 || n.length !== 4 || Number.isNaN(mask)) return false;
+        const shifts = 32 - mask;
+        const addrInt = (a[0] << 24) | (a[1] << 16) | (a[2] << 8) | a[3];
+        const netInt = (n[0] << 24) | (n[1] << 16) | (n[2] << 8) | n[3];
+        return (addrInt >>> shifts) === (netInt >>> shifts);
+      },
+    };
+  }
+  return _blockSetCache;
+}
+
+function _isPrivateIp(hostname) {
+  const { isInSubnet } = _getBlockedIpSet();
+  for (const cidr of _BLOCKED_CIDRS) {
+    try {
+      if (isInSubnet(hostname, cidr)) return true;
+    } catch { /* malformed CIDR — skip */ }
+  }
+  return false;
+}
+
+/**
+ * Return a reason string if a URL should be blocked; return `null` when safe.
+ * Guards against SSRF (Server-Side Request Forgery) by rejecting private and
+ * link-local addresses before any fetch leaves the main process.
+ */
+function isUrlUnsafe(urlString) {
+  let url;
+  try {
+    url = new URL(urlString);
+  } catch {
+    return 'Invalid URL';
+  }
+
+  const host = (url.hostname || '').toLowerCase().trim();
+  if (!host) return 'Missing hostname';
+
+  // Always-block hostnames (cloud metadata endpoints)
+  if (_BLOCKED_HOSTNAMES.has(host)) {
+    return `Blocked hostname: ${host}`;
+  }
+
+  // Always-block literal IP addresses in private ranges
+  if (_isPrivateIp(host)) {
+    return `Blocked private IP: ${host}`;
+  }
+
+  // Catch-all for IPv6 loopback / link-local and mis-parsed IPv4 reserved ranges.
+  if (/^\[?(::1|fc00:|fe80:|fd00:|169\.254\.|127\.|0\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)\]?/i.test(host)) {
+    return `Blocked private/reserved address: ${host}`;
+  }
+
+  return null;
+}
+
+
+
+/** Regex that catches common secret prefixes in URLs (exfiltration prevention). */
+const _SECRET_PREFIX_RE = /\b(sk-[a-zA-Z0-9_-]{10,}|[0-9a-f]{32,}|api[_-]?key\s*=\s*[a-zA-Z0-9_-]{8,}|token\s*=\s*[a-zA-Z0-9_-]{16,}|password\s*=\s*\S{8,}|secret\s*=\s*\S{8,})/i;
+
+/**
+ * Return `true` if a URL's query string or path appears to embed an API key,
+ * token, or password — a common exfiltration vector.
+ */
+function containsExfiltratedSecret(urlString) {
+  try {
+    const decoded = decodeURIComponent(urlString);
+    return _SECRET_PREFIX_RE.test(decoded);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Read a Response body with a hard byte limit.
+ * Throws if the body exceeds `maxBytes` so oversized payloads cannot OOM the
+ * main process or renderer.
+ */
+async function readWithLengthLimit(response, maxBytes, label) {
+  const reader = response.body?.getReader();
+  if (!reader) {
+    const text = await response.text();
+    if (text.length > maxBytes) {
+      throw new Error(`${label} response exceeds ${maxBytes} byte limit.`);
+    }
+    return text;
+  }
+  const chunks = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value?.byteLength || 0;
+      if (total > maxBytes) {
+        throw new Error(`${label} response exceeds ${maxBytes} byte limit.`);
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const decoder = new TextDecoder();
+  return chunks.map((c) => decoder.decode(c, { stream: true })).join('') + decoder.decode();
 }
 
 function normalizeApiKey(apiKey) {
@@ -380,7 +494,7 @@ function createWindow() {
 
   win.webContents.setWindowOpenHandler(({ url }) => {
     if (isExternalHttpUrl(url)) {
-      openExternalUrl(url);
+      shell.openExternal(url).catch(() => {});
     }
     return { action: 'deny' };
   });
@@ -389,7 +503,7 @@ function createWindow() {
     if (isTrustedRendererUrl(url)) return;
     event.preventDefault();
     if (isExternalHttpUrl(url)) {
-      openExternalUrl(url);
+      shell.openExternal(url).catch(() => {});
     }
   });
 
@@ -680,21 +794,99 @@ function normalizeDuckDuckGoUrl(value) {
   }
 }
 
-function parseDuckDuckGoResults(html) {
+function parseDuckDuckGoLiteResults(html) {
   const results = [];
-  const resultPattern = /<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>[\s\S]*?<a[^>]+class="result__snippet"[^>]*>([\s\S]*?)<\/a>/g;
-  let match;
+  const seenUrls = new Set();
+  let m;
 
-  while ((match = resultPattern.exec(html)) !== null) {
-    const title = decodeHtmlEntities(match[2]);
-    const url = normalizeDuckDuckGoUrl(match[1]);
-    const snippet = decodeHtmlEntities(match[3]);
-    if (title && url) {
-      results.push({ title, url, snippet });
+  // Pattern 1: href before class (observed structure on lite.duckduckgo.com)
+  const hrefFirst =
+    /<a[^>]*?\bhref\s*=\s*["']([^"']+)["'][^>]*?\bclass\s*=\s*["'](?:[^"']*\s)?result-link(?:\s[^"']*)?["'][^>]*>([\s\S]*?)<\/a>/gi;
+  while ((m = hrefFirst.exec(html)) !== null) {
+    const url = m[1].trim();
+    if (!seenUrls.has(url)) {
+      seenUrls.add(url);
+      results.push({ title: m[2], url, snippet: '' });
     }
   }
 
-  return results;
+  // Pattern 2: class before href (future-proofing)
+  const classFirst =
+    /<a[^>]*?\bclass\s*=\s*["'](?:[^"']*\s)?result-link(?:\s[^"']*)?["'][^>]*?\bhref\s*=\s*["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
+  while ((m = classFirst.exec(html)) !== null) {
+    const url = m[1].trim();
+    if (!seenUrls.has(url)) {
+      seenUrls.add(url);
+      results.push({ title: m[2], url, snippet: '' });
+    }
+  }
+
+  // Collect snippets in document order
+  const snippets = [];
+  const snippetRe =
+    /<td[^>]*?\bclass\s*=\s*["'](?:[^"']*\s)?result-snippet(?:\s[^"']*)?["'][^>]*>([\s\S]*?)<\/td>/gi;
+  while ((m = snippetRe.exec(html)) !== null) {
+    snippets.push(m[1]);
+  }
+
+  // Pair snippets by index
+  for (let i = 0; i < results.length && i < snippets.length; i++) {
+    results[i].snippet = snippets[i];
+  }
+
+  return results
+    .map((r) => ({
+      title: decodeHtmlEntities(r.title),
+      url: normalizeDuckDuckGoUrl(r.url),
+      snippet: decodeHtmlEntities(r.snippet),
+    }))
+    .filter((r) => r.title && r.url);
+}
+
+/** In-memory cache for extracted page content (r.jina.ai results). */
+let webContentCache = new Map();
+
+async function fetchJinaContent(url, timeoutMs = 8000) {
+  // Guard: block URLs targeting private/internal networks (SSRF protection)
+  const unsafeReason = isUrlUnsafe(url);
+  if (unsafeReason) {
+    throw new Error(`Unsafe URL: ${unsafeReason}`);
+  }
+
+  // Guard: URLs must not appear to embed secrets (exfiltration prevention)
+  if (containsExfiltratedSecret(url)) {
+    throw new Error('Blocked: URL appears to contain an embedded secret/token.');
+  }
+
+  const now = Date.now();
+  const cached = webContentCache.get(url);
+  if (cached && now - cached.loadedAt < WEB_CONTENT_CACHE_TTL_MS) {
+    return cached.content;
+  }
+  const jinaUrl = `https://r.jina.ai/http://${encodeURIComponent(url)}`;
+  const res = await fetch(jinaUrl, {
+    signal: AbortSignal.timeout(timeoutMs),
+    headers: { accept: 'text/markdown, text/plain, */*' },
+  });
+  if (!res.ok) {
+    return null;
+  }
+  const text = await readWithLengthLimit(res, JINA_RESPONSE_MAX_BYTES, 'jina.ai');
+  if (!text || text.length < 20) {
+    return null;
+  }
+  webContentCache.set(url, { content: text, loadedAt: now });
+  return text;
+}
+
+/** Clean up stale entries from the web content cache occasionally. */
+function pruneWebContentCache() {
+  const now = Date.now();
+  for (const [key, entry] of webContentCache.entries()) {
+    if (now - entry.loadedAt > WEB_CONTENT_CACHE_TTL_MS) {
+      webContentCache.delete(key);
+    }
+  }
 }
 
 /** Send a chunk/error to the renderer for a given request. */
@@ -814,34 +1006,94 @@ ipcMain.handle('chutes:models', async (event) => {
 });
 
 ipcMain.handle('chutes:webSearch', async (event, payload = {}) => {
+  const nowIso = new Date().toISOString();
   try {
     assertTrustedSender(event);
-    const { query } = payload || {};
+    const { query, deepSearch = false } = payload || {};
     const normalizedQuery = typeof query === 'string' ? query.trim() : '';
     if (!normalizedQuery) {
-      return { ok: false, error: 'Search query is required.' };
+      return {
+        ok: false, error: 'Search query is required.', results: [],
+        fetchedAt: nowIso, provider: 'DuckDuckGo', deepSearch: false,
+        extractedCount: 0, totalResults: 0, errors: 0,
+      };
     }
 
-    const url = new URL('https://duckduckgo.com/html/');
-    url.searchParams.set('q', normalizedQuery);
+    const searchUrl = 'https://lite.duckduckgo.com/lite/';
+    const body = new URLSearchParams();
+    body.append('q', normalizedQuery);
 
-    const response = await fetch(url, {
+    const response = await fetch(searchUrl, {
+      method: 'POST',
       signal: AbortSignal.timeout(12_000),
       headers: {
         accept: 'text/html',
+        'content-type': 'application/x-www-form-urlencoded',
         'user-agent': 'ChutesE2EEChat/1.0',
       },
+      body: body.toString(),
     });
 
     if (!response.ok) {
-      return { ok: false, error: `Search failed: HTTP ${response.status}` };
+      return {
+        ok: false, error: `Search failed: HTTP ${response.status}`, results: [],
+        fetchedAt: nowIso, provider: 'DuckDuckGo', deepSearch: Boolean(deepSearch),
+        extractedCount: 0, totalResults: 0, errors: 0,
+      };
     }
 
-    const html = await response.text();
-    const results = parseDuckDuckGoResults(html).slice(0, 5);
-    return { ok: true, results, fetchedAt: new Date().toISOString(), provider: 'DuckDuckGo' };
+    const html = await readWithLengthLimit(response, WEB_RESPONSE_MAX_BYTES, 'DuckDuckGo');
+    const results = parseDuckDuckGoLiteResults(html).slice(0, 5);
+
+    if (results.length === 0) {
+      return {
+        ok: true, results: [], fetchedAt: nowIso, provider: 'DuckDuckGo',
+        deepSearch: false, extractedCount: 0, totalResults: 0, errors: 0,
+      };
+    }
+
+    // Base response fields — every success path carries the same shape
+    const baseResponse = {
+      ok: true,
+      results,
+      fetchedAt: nowIso,
+      provider: 'DuckDuckGo',
+      deepSearch: Boolean(deepSearch),
+      totalResults: results.length,
+    };
+
+    if (!deepSearch) {
+      return { ...baseResponse, extractedCount: 0, errors: 0 };
+    }
+
+    pruneWebContentCache();
+    const limit = Math.min(results.length, WEB_CONTENT_MAX_CONCURRENT);
+    let extractedCount = 0;
+    let errorCount = 0;
+    for (let i = 0; i < limit; i++) {
+      try {
+        // fetchJinaContent already enforces SSRF and secret-exfil guards
+        const article = await fetchJinaContent(results[i].url, 8000);
+        if (article) {
+          results[i].article = article;
+          extractedCount += 1;
+        }
+      } catch (err) {
+        errorCount += 1;
+        // Leave article absent; snippet is always present from DDG
+      }
+    }
+    return {
+      ...baseResponse,
+      extractedCount,
+      errors: errorCount,
+    };
   } catch (err) {
-    return { ok: false, error: getErrorMessage(err) };
+    return {
+      ok: false, error: getErrorMessage(err), results: [],
+      fetchedAt: nowIso, provider: 'DuckDuckGo',
+      deepSearch: false, extractedCount: 0, totalResults: 0, errors: 0,
+    };
   }
 });
 
