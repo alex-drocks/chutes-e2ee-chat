@@ -36,10 +36,29 @@ import {
   ChutesRateLimitError,
   ChutesAuthError,
   ChutesModelNotFoundError,
+  ChutesE2EESecurityError,
 } from '../lib/chutes/errors.js';
 import { _fetchWithRetry } from '../lib/chutes/utils.js';
 import { ChutesE2EETransport } from '../lib/chutes/ChutesE2EETransport.js';
 
+function seedTransportModel(transport, overrides = {}) {
+  const meta = {
+    id: 'MockModel-TEE',
+    chuteId: 'chute-1',
+    inputModalities: ['text'],
+    outputModalities: ['text'],
+    supportedFeatures: [],
+    contextLength: null,
+    maxOutputLength: null,
+    confidentialCompute: true,
+    ...overrides,
+  };
+
+  transport._discovery._modelMap.set(meta.id, meta.chuteId);
+  transport._discovery._modelMeta.set(meta.id, meta);
+  transport._discovery._modelMapLoadedAt = Date.now();
+  return meta;
+}
 describe('Protocol Invariants (no network)', () => {
 
   // ---------------------------------------------------------------------------
@@ -268,4 +287,75 @@ describe('Protocol Invariants (no network)', () => {
     );
   });
 
+  it('should reject non-confidential model metadata before invoking E2EE', async () => {
+    const transport = new ChutesE2EETransport({ apiKey: 'test' });
+    seedTransportModel(transport, {
+      id: 'PlainModel',
+      chuteId: 'chute-plain',
+      confidentialCompute: false,
+    });
+
+    let fetchCalled = false;
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () => {
+      fetchCalled = true;
+      return new Response('unexpected');
+    };
+
+    try {
+      await assert.rejects(
+        transport.chat({ model: 'PlainModel', messages: [{ role: 'user', content: 'hello' }], stream: false }),
+        (err) => err instanceof ChutesE2EESecurityError && err.code === 'E2EE_SECURITY_ERROR',
+      );
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+
+    assert.strictEqual(fetchCalled, false, 'unsafe model should be rejected before network invoke');
+  });
+
+  it('should send only encrypted binary payloads to the E2EE invoke endpoint', async () => {
+    const prompt = 'SecretPrompt_Transport_424242';
+    const { pk } = await generateKeyPair();
+    const transport = new ChutesE2EETransport({ apiKey: 'test' });
+    const meta = seedTransportModel(transport, { id: 'MockModel-TEE', chuteId: 'chute-secure' });
+
+    transport._discovery._fetchInstances = async () => ({
+      nonceExpiresAt: Date.now() + 60_000,
+      instances: [{
+        instanceId: 'inst-1',
+        e2ePubkey: pk.toString('base64'),
+        nonces: ['nonce-1'],
+      }],
+    });
+
+    let captured = null;
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async (url, init = {}) => {
+      captured = {
+        url: String(url),
+        headers: init.headers,
+        body: Buffer.from(init.body),
+      };
+      return new Response(Buffer.from('not-a-valid-encrypted-response'), { status: 200 });
+    };
+
+    try {
+      await assert.rejects(
+        transport.chat({ model: meta.id, messages: [{ role: 'user', content: prompt }], stream: false }),
+        /Response blob too small|decryption failed|invalid authentication tag/,
+      );
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+
+    assert.ok(captured, 'expected invoke fetch to be called');
+    assert.strictEqual(captured.url, 'https://api.chutes.ai/e2e/invoke');
+    assert.strictEqual(captured.headers['Content-Type'], 'application/octet-stream');
+    assert.strictEqual(captured.headers['X-E2E-Path'], '/v1/chat/completions');
+    assert.ok(Buffer.isBuffer(captured.body), 'body should be binary');
+    assert.ok(!captured.body.includes(Buffer.from(prompt)), 'prompt must not appear in invoke body');
+    assert.ok(!captured.body.toString('utf8').includes('messages'), 'raw JSON field names must not appear in invoke body');
+    assert.ok(!captured.body.toString('utf8').includes(prompt), 'prompt text must not appear in invoke body');
+  });
 });
