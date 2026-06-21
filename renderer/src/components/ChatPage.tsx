@@ -2091,7 +2091,6 @@ type WebSearchSummary = {
   extractionAttemptedCount: number;
   errors: number;
   deepSearch: boolean;
-  warning: string;
 };
 
 function getWebSearchSummary(output: unknown): WebSearchSummary | null {
@@ -2119,9 +2118,6 @@ function getWebSearchSummary(output: unknown): WebSearchSummary | null {
     extractionAttemptedCount,
     errors,
     deepSearch,
-    warning: deepSearch && errors > 0
-      ? `${errors} ${errors === 1 ? 'page' : 'pages'} could not be extracted; snippets are still available.`
-      : '',
   };
 }
 

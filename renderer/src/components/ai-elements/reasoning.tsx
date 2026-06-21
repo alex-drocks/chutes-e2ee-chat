@@ -90,16 +90,20 @@ export function ReasoningTrigger({ className, children, ...props }: ReasoningTri
 
 type ReasoningContentProps = HTMLAttributes<HTMLDivElement>;
 
-export function ReasoningContent({ className, ...props }: ReasoningContentProps) {
-  const { isOpen } = useReasoningContext();
+export function ReasoningContent({ className, style, ...props }: ReasoningContentProps) {
+  const { isOpen, isStreaming } = useReasoningContext();
   if (!isOpen) return null;
 
   return (
     <div
       className={cn(
-        'max-h-[42vh] overflow-y-auto border-t border-[var(--border)] px-3 py-2 text-xs italic leading-relaxed text-[var(--text-secondary)] whitespace-pre-wrap',
+        'overflow-y-auto border-t border-[var(--border)] px-3 py-2 text-xs italic leading-relaxed text-[var(--text-secondary)] whitespace-pre-wrap',
         className,
       )}
+      style={{
+        maxHeight: isStreaming ? 'min(42vh, 380px)' : 'min(28vh, 260px)',
+        ...style,
+      }}
       {...props}
     />
   );
