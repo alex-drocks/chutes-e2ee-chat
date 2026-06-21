@@ -1483,7 +1483,6 @@ function AssistantMessage({
         {text && (
           <MessageContent from="assistant" variant="flat">
             <MessageResponse isStreaming={isStreaming}>{text}</MessageResponse>
-            {isStreaming && <span className="ml-1 inline-block h-1.5 w-1.5 rounded-full bg-[var(--accent)] align-middle" />}
           </MessageContent>
         )}
 
