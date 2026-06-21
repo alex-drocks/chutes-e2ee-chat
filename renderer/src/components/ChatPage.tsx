@@ -73,17 +73,8 @@ import type {
   MessageMemory,
   MessageStatus,
 } from '@/lib/types';
-
-const DEFAULT_MODEL = 'Qwen/Qwen3-32B-TEE';
-const FALLBACK_MODELS = [
-  'Qwen/Qwen3-32B-TEE',
-  'moonshotai/Kimi-K2.6-TEE',
-  'moonshotai/Kimi-K2.5-TEE',
-  'deepseek-ai/DeepSeek-V3-TEE',
-  'deepseek-ai/DeepSeek-R1-TEE',
-];
-
 const MODEL_STORAGE_KEY = 'chutes-e2ee-chat.lastModel';
+
 const DEEP_SEARCH_STORAGE_KEY = 'chutes-e2ee-chat.deepSearch';
 const MAX_RETRIES = 2;
 
@@ -181,7 +172,16 @@ function buildWebSearchToolOutput(query: string, result: ChutesWebSearchResponse
         ? { articleLabel: 'Full-page source material extracted from this search result' }
         : {}),
     })),
+
   };
+}
+
+function isCompatibleChatModel(entry: ChutesModelMetadata) {
+  const inputModalities = Array.isArray(entry.inputModalities) ? entry.inputModalities : ['text'];
+  const outputModalities = Array.isArray(entry.outputModalities) ? entry.outputModalities : ['text'];
+  return Boolean(entry.id) && Boolean(entry.chuteId) && Boolean(entry.confidentialCompute) &&
+    inputModalities.includes('text') &&
+    outputModalities.includes('text');
 }
 
 export default function ChatPage() {
@@ -192,8 +192,10 @@ export default function ChatPage() {
   const [deepSearchEnabled, setDeepSearchEnabled] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [streamStage, setStreamStage] = useState<StreamStage>('idle');
-  const [model, setModelState] = useState(DEFAULT_MODEL);
-  const [models, setModels] = useState<string[]>(FALLBACK_MODELS);
+  const [model, setModelState] = useState('');
+  const [models, setModels] = useState<string[]>([]);
+  const [modelsLoading, setModelsLoading] = useState(true);
+  const [modelsError, setModelsError] = useState('');
   const [modelMetadata, setModelMetadata] = useState<Record<string, ChutesModelMetadata>>({});
   const [modelStats, setModelStats] = useState<Record<string, ChutesModelStats>>({});
   const [modelStatsLoading, setModelStatsLoading] = useState(false);
@@ -213,6 +215,7 @@ export default function ChatPage() {
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const modelInputRef = useRef<HTMLInputElement>(null);
+  const modelManuallySelectedRef = useRef(false);
   const menuRef = useRef<HTMLDivElement>(null);
   const settingsRef = useRef<HTMLDivElement>(null);
   const retryCountRef = useRef(0);
@@ -221,7 +224,7 @@ export default function ChatPage() {
   const memoryStoreRef = useRef<MemoryStore>(new MemoryStore());
   const addToolOutputRef = useRef<any>(null);
   const chatConfigRef = useRef<ChutesChatConfig>({
-    model: DEFAULT_MODEL,
+    model: '',
     toolsEnabled: true,
     includeImages: false,
   });
@@ -400,6 +403,30 @@ export default function ChatPage() {
     }
   }, [aiStatus]);
 
+  const chooseInitialModel = useCallback((availableModels: string[]) => {
+    if (availableModels.length === 0) {
+      setModelState('');
+      return;
+    }
+
+    setModelState((currentModel) => {
+      if (availableModels.includes(currentModel)) return currentModel;
+
+      let storedModel = '';
+      if (typeof window !== 'undefined') {
+        try {
+          storedModel = window.localStorage.getItem(MODEL_STORAGE_KEY) || '';
+        } catch {
+          /* ignore unavailable storage */
+        }
+      }
+
+      if (storedModel && availableModels.includes(storedModel)) return storedModel;
+
+      return availableModels[0]!;
+    });
+  }, []);
+
   const setModel = useCallback((nextModel: string) => {
     setModelState(nextModel);
     if (typeof window !== 'undefined') {
@@ -417,6 +444,7 @@ export default function ChatPage() {
     setHighlightedModelIndex(0);
     setShowModelMenu(false);
     modelInputRef.current?.blur();
+    modelManuallySelectedRef.current = true;
   }, [setModel]);
 
   const applyApiKeyStatus = useCallback((res: any) => {
@@ -470,25 +498,61 @@ export default function ChatPage() {
   }, [deepSearchEnabled]);
 
   useEffect(() => {
-    if (typeof window === 'undefined' || !window.chutes) return;
+    if (typeof window === 'undefined') return;
+    if (!window.chutes) {
+      setModelsLoading(false);
+      setModelsError('Chutes bridge unavailable.');
+      chooseInitialModel([]);
+      return;
+    }
+
+    let cancelled = false;
+    setModelsLoading(true);
+    setModelsError('');
+
     window.chutes.models()
       .then((res: any) => {
-        if (res.ok && res.models && res.models.length > 0) {
-          const teeModels = res.models.filter((m: string) => m.includes('TEE'));
-          if (teeModels.length > 0) setModels(teeModels);
+        if (cancelled) return;
+
+        if (!res.ok) {
+          setModels([]);
+          setModelMetadata({});
+          setModelsError(res.error || 'Could not load Chutes models.');
+          chooseInitialModel([]);
+          return;
         }
-        if (res.ok && res.metadata) {
-          setModelMetadata(
-            Object.fromEntries(
-              res.metadata.map((entry: ChutesModelMetadata) => [entry.id, entry]),
-            ),
-          );
+
+        const metadata = Array.isArray(res.metadata) ? res.metadata : [];
+        const metadataById = Object.fromEntries(
+          metadata.map((entry: ChutesModelMetadata) => [entry.id, entry]),
+        );
+        const discoveredModels = metadata
+          .filter(isCompatibleChatModel)
+          .map((entry: ChutesModelMetadata) => entry.id);
+
+        setModelMetadata(metadataById);
+        setModels(discoveredModels);
+        chooseInitialModel(discoveredModels);
+
+        if (discoveredModels.length === 0) {
+          setModelsError('No Chutes E2EE text models are currently advertised.');
         }
       })
-      .catch(() => {
-        setModels(FALLBACK_MODELS);
+      .catch((err) => {
+        if (cancelled) return;
+        setModels([]);
+        setModelMetadata({});
+        setModelsError(getErrorMessage(err, 'Could not load Chutes models.'));
+        chooseInitialModel([]);
+      })
+      .finally(() => {
+        if (!cancelled) setModelsLoading(false);
       });
-  }, []);
+
+    return () => {
+      cancelled = true;
+    };
+  }, [chooseInitialModel]);
 
   useEffect(() => {
     if (typeof window === 'undefined' || !window.chutes) return;
@@ -551,15 +615,37 @@ export default function ChatPage() {
     return () => document.removeEventListener('mousedown', handleClick);
   }, []);
 
+  const sortedModels = useMemo(() => sortModelsByStats(models, modelStats), [models, modelStats]);
+
+  useEffect(() => {
+    if (sortedModels.length === 0 || modelManuallySelectedRef.current) return;
+
+    let storedModel = '';
+    if (typeof window !== 'undefined') {
+      try {
+        storedModel = window.localStorage.getItem(MODEL_STORAGE_KEY) || '';
+      } catch {
+        /* ignore unavailable storage */
+      }
+    }
+
+    if (storedModel && sortedModels.includes(storedModel)) return;
+
+    const topModel = sortedModels[0]!;
+    if (model !== topModel) {
+      setModelState(topModel);
+    }
+  }, [model, sortedModels]);
+
   const filteredModels = useMemo(() => {
     const query = modelQuery.trim().toLowerCase();
-    if (!query) return models;
+    if (!query) return sortedModels;
     const terms = query.split(/\s+/).filter(Boolean);
-    return models.filter((m) => {
+    return sortedModels.filter((m) => {
       const lower = m.toLowerCase();
       return terms.every((term) => lower.includes(term));
     });
-  }, [modelQuery, models]);
+  }, [modelQuery, sortedModels]);
 
   useEffect(() => {
     setHighlightedModelIndex((idx) => {
@@ -630,7 +716,7 @@ export default function ChatPage() {
     const inputSnapshot = input;
     const enteredText = input.trim();
     const text = enteredText || (attachmentSnapshot.length > 0 ? 'Please review the attached file(s).' : '');
-    if ((!text && attachmentSnapshot.length === 0) || isLoading) return;
+    if ((!text && attachmentSnapshot.length === 0) || isLoading || modelsLoading || !model) return;
     retryCountRef.current = 0;
     clearAiError();
 
@@ -683,8 +769,10 @@ export default function ChatPage() {
       });
     }
   }, [
+    modelsLoading,
     attachments,
     input,
+    model,
     isLoading,
     sendAiMessage,
     getCurrentChatConfig,
@@ -1040,9 +1128,11 @@ export default function ChatPage() {
                 aria-autocomplete="list"
                 className="bg-transparent text-sm text-[var(--text-primary)] outline-none placeholder-[var(--text-secondary)]"
                 style={{ width: modelInputWidth }}
-                placeholder="Search models"
+                placeholder={modelsLoading ? 'Loading models...' : 'Search models'}
+                disabled={modelsLoading && models.length === 0}
                 spellCheck={false}
               />
+              {modelsLoading && <Loader2 className="h-3.5 w-3.5 animate-spin text-[var(--accent)]" />}
               <ModelStatsLine
                 stats={selectedModelStats}
                 loading={modelStatsLoading && !selectedModelStats}
@@ -1106,7 +1196,9 @@ export default function ChatPage() {
                     })}
                   </>
                 ) : (
-                  <div className="px-3 py-2 text-sm text-[var(--text-secondary)] opacity-70">No matching models</div>
+                  <div className="px-3 py-2 text-sm text-[var(--text-secondary)] opacity-70">
+                    {modelsLoading ? 'Loading models...' : modelsError || 'No matching models'}
+                  </div>
                 )}
               </div>
             )}
@@ -1216,6 +1308,14 @@ export default function ChatPage() {
             input={input}
             attachments={attachments}
             clipboardStatus={clipboardStatus}
+            canSend={Boolean(model) && !modelsLoading}
+            sendDisabledReason={
+              modelsLoading
+                ? 'Models are still loading.'
+                : model
+                  ? undefined
+                  : modelsError || 'No compatible Chutes model is available.'
+            }
             isLoading={isLoading}
             webSearchEnabled={webSearchEnabled}
             deepSearchEnabled={deepSearchEnabled}
@@ -1320,7 +1420,10 @@ function AssistantMessage({
   const toolParts = collectToolParts(message.parts);
   const sources = extractSources(toolParts);
   const showEmpty = !text && !reasoning && toolParts.length === 0;
-  const statusHistory = toolPartsToStatusHistory(toolParts);
+  const webSearchParts = toolParts.filter((part) => part.toolName === 'web_search');
+  const otherToolParts = toolParts.filter((part) => part.toolName !== 'web_search');
+  const otherStatusHistory = toolPartsToStatusHistory(otherToolParts);
+  const hasWebSearch = webSearchParts.length > 0;
 
   const copy = async () => {
     try {
@@ -1343,16 +1446,23 @@ function AssistantMessage({
           />
         )}
 
-        {statusHistory.length > 0 && <StatusTimeline history={statusHistory} compact={!text} />}
+        {otherStatusHistory.length > 0 && <StatusTimeline history={otherStatusHistory} compact={!text} />}
 
-        {reasoning && (
-          <Reasoning isStreaming={isStreaming && !text} chars={reasoning.length}>
+        {hasWebSearch ? (
+          <WebSearchResearchPanel
+            parts={webSearchParts}
+            reasoning={reasoning}
+            isStreaming={isStreaming}
+            sources={sources}
+          />
+        ) : reasoning ? (
+          <Reasoning isStreaming={isStreaming && !text} chars={reasoning.length} defaultOpen={isStreaming}>
             <ReasoningTrigger />
             <ReasoningContent>{reasoning}</ReasoningContent>
           </Reasoning>
-        )}
+        ) : null}
 
-        {toolParts.map((part) => (
+        {otherToolParts.map((part) => (
           <Tool key={part.toolCallId} state={part.state} isError={part.state === 'output-error'}>
             <ToolHeader name={part.toolName} state={part.state} isError={part.state === 'output-error'} />
             {part.state === 'input-available' && part.input?.query && (
@@ -1361,13 +1471,10 @@ function AssistantMessage({
             {part.state === 'output-error' && part.errorText && (
               <ToolContent>{part.errorText}</ToolContent>
             )}
-            {part.toolName === 'web_search' && part.state === 'output-available' && (
-              <WebSearchToolContent output={part.output} />
-            )}
           </Tool>
         ))}
 
-        <Sources sources={sources} />
+        {!hasWebSearch && <Sources sources={sources} />}
 
         {text && (
           <MessageContent from="assistant" variant="flat">
@@ -1408,21 +1515,85 @@ function AssistantMessage({
   );
 }
 
-function WebSearchToolContent({ output }: { output: unknown }) {
-  const summary = getWebSearchSummary(output);
-  if (!summary) return null;
+function WebSearchResearchPanel({
+  parts,
+  reasoning,
+  isStreaming,
+  sources,
+}: {
+  parts: ReturnType<typeof collectToolParts>;
+  reasoning: string;
+  isStreaming: boolean;
+  sources: SourceItem[];
+}) {
+  const latest = [...parts].reverse().find((part) => part.output || part.input?.query || part.errorText) || parts[parts.length - 1];
+  const summary = getWebSearchSummary(latest?.output);
+  const isError = latest?.state === 'output-error';
+  const isRunning = parts.some((part) => !part.state || !part.state.startsWith('output'));
+  const query = latest?.input?.query;
+  const title = isError ? 'Search failed' : isRunning ? 'Searching the web' : 'Web search complete';
+  const detail = isError
+    ? latest?.errorText || 'The search tool returned an error.'
+    : summary?.status || (query ? `Looking for: ${query}` : 'Gathering live sources');
 
   return (
-    <ToolContent>
-      <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
-        <span>{summary.status}</span>
-        <span className="opacity-50">/</span>
-        <span>{summary.resultText}</span>
+    <div className="mb-3 overflow-hidden rounded-xl border border-emerald-500/20 bg-[linear-gradient(135deg,rgba(16,185,129,0.10),rgba(18,18,18,0.88))] shadow-sm shadow-black/10">
+      <div className="flex flex-col gap-3 px-3 py-3 sm:flex-row sm:items-start sm:justify-between">
+        <div className="flex min-w-0 gap-2.5">
+          <span className={cn(
+            'mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border',
+            isError
+              ? 'border-red-900/60 bg-red-950/40 text-red-300'
+              : 'border-emerald-500/25 bg-emerald-500/10 text-emerald-300',
+          )}>
+            {isError ? (
+              <AlertTriangle className="h-4 w-4" />
+            ) : isRunning ? (
+              <Loader2 className="h-4 w-4 animate-spin" />
+            ) : (
+              <Check className="h-4 w-4" />
+            )}
+          </span>
+          <div className="min-w-0">
+            <div className="text-sm font-medium text-[var(--text-primary)]">{title}</div>
+            <div className="mt-0.5 text-xs leading-relaxed text-[var(--text-secondary)]">{detail}</div>
+            {query && (
+              <div className="mt-2 inline-flex max-w-full items-center gap-1.5 rounded-lg border border-white/10 bg-black/20 px-2 py-1 text-xs text-[var(--text-secondary)]">
+                <Search className="h-3 w-3 shrink-0" />
+                <span className="truncate">{query}</span>
+              </div>
+            )}
+          </div>
+        </div>
+        {summary && (
+          <div className="flex shrink-0 flex-wrap gap-1.5 sm:justify-end">
+            <SearchMetric label="Results" value={summary.totalResults.toLocaleString()} />
+            <SearchMetric
+              label={summary.deepSearch ? 'Pages read' : 'Mode'}
+              value={summary.deepSearch ? `${summary.extractedCount}/${summary.extractionAttemptedCount}` : 'Snippets'}
+            />
+            <SearchMetric label="Sources" value={(sources.length || summary.totalResults).toLocaleString()} />
+          </div>
+        )}
       </div>
-      {summary.warning && (
-        <div className="mt-1 text-amber-300/80">{summary.warning}</div>
+
+      {reasoning && (
+        <Reasoning isStreaming={isStreaming} chars={reasoning.length} defaultOpen className="mx-3 mb-3 border-emerald-500/15 bg-black/15">
+          <ReasoningTrigger>{isStreaming ? 'Thinking through sources' : 'Reasoning through sources'}</ReasoningTrigger>
+          <ReasoningContent>{reasoning}</ReasoningContent>
+        </Reasoning>
       )}
-    </ToolContent>
+
+      {sources.length > 0 && <Sources sources={sources} className="mx-3 mb-3 border-[var(--border)]/70 bg-black/10" />}
+    </div>
+  );
+}
+function SearchMetric({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="min-w-20 rounded-lg border border-white/10 bg-black/20 px-2.5 py-1.5 text-right">
+      <div className="text-[10px] uppercase text-[var(--text-secondary)] opacity-70">{label}</div>
+      <div className="text-xs font-medium text-[var(--text-primary)]">{value}</div>
+    </div>
   );
 }
 
@@ -1430,6 +1601,8 @@ function ChatComposer({
   input,
   attachments,
   clipboardStatus,
+  canSend,
+  sendDisabledReason,
   isLoading,
   webSearchEnabled,
   deepSearchEnabled,
@@ -1449,6 +1622,8 @@ function ChatComposer({
   input: string;
   attachments: MessageAttachment[];
   clipboardStatus: ClipboardStatus | null;
+  canSend: boolean;
+  sendDisabledReason?: string;
   isLoading: boolean;
   webSearchEnabled: boolean;
   deepSearchEnabled: boolean;
@@ -1549,7 +1724,11 @@ function ChatComposer({
               <Square className="h-4 w-4" />
             </PromptInputSubmit>
           ) : (
-            <PromptInputSubmit status="ready" disabled={!input.trim() && attachments.length === 0} title="Send message">
+            <PromptInputSubmit
+              status="ready"
+              disabled={!canSend || (!input.trim() && attachments.length === 0)}
+              title={sendDisabledReason || 'Send message'}
+            >
               <Send className="h-4 w-4" />
             </PromptInputSubmit>
           )}
@@ -1907,7 +2086,11 @@ function extractSources(toolParts: ReturnType<typeof collectToolParts>): SourceI
 
 type WebSearchSummary = {
   status: string;
-  resultText: string;
+  totalResults: number;
+  extractedCount: number;
+  extractionAttemptedCount: number;
+  errors: number;
+  deepSearch: boolean;
   warning: string;
 };
 
@@ -1931,7 +2114,11 @@ function getWebSearchSummary(output: unknown): WebSearchSummary | null {
 
   return {
     status,
-    resultText: `${totalResults} ${totalResults === 1 ? 'source' : 'sources'}`,
+    totalResults,
+    extractedCount,
+    extractionAttemptedCount,
+    errors,
+    deepSearch,
     warning: deepSearch && errors > 0
       ? `${errors} ${errors === 1 ? 'page' : 'pages'} could not be extracted; snippets are still available.`
       : '',
@@ -2067,6 +2254,41 @@ function formatUtilization(value?: number) {
   if (!Number.isFinite(value) || value === undefined || value < 0) return null;
   return `${Math.round(value * 100)}% Util`;
 }
+function finiteMetric(value: unknown, fallback: number) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : fallback;
+}
+
+function modelSortMetrics(stats?: ChutesModelStats) {
+  return {
+    activeInstances: finiteMetric(stats?.activeInstanceCount ?? stats?.totalInstanceCount, -1),
+    utilization: finiteMetric(stats?.utilizationCurrent ?? stats?.utilization5m, Number.MAX_SAFE_INTEGER),
+    tps: finiteMetric(stats?.averageTps, -1),
+    ttft: finiteMetric(stats?.averageTtft, Number.MAX_SAFE_INTEGER),
+  };
+}
+
+function sortModelsByStats(models: string[], modelStats: Record<string, ChutesModelStats>) {
+  return [...models].sort((a, b) => {
+    const aStats = modelSortMetrics(modelStats[a]);
+    const bStats = modelSortMetrics(modelStats[b]);
+
+    const tpsDelta = bStats.tps - aStats.tps;
+    if (tpsDelta !== 0) return tpsDelta;
+
+    const activeDelta = bStats.activeInstances - aStats.activeInstances;
+    if (activeDelta !== 0) return activeDelta;
+
+    const utilizationDelta = aStats.utilization - bStats.utilization;
+    if (utilizationDelta !== 0) return utilizationDelta;
+
+    const ttftDelta = aStats.ttft - bStats.ttft;
+    if (ttftDelta !== 0) return ttftDelta;
+
+    return a.localeCompare(b);
+  });
+}
+
 
 function formatModelMetrics(stats?: ChutesModelStats) {
   if (!stats) {

@@ -54,7 +54,6 @@ export type ChutesUIMessage = UIMessage<
   }
 >;
 
-const DEFAULT_MODEL = 'Qwen/Qwen3-32B-TEE';
 const TOOL_CALLS_SECTION_MARKER = '<|tool_calls_section_begin|>';
 
 export class ChutesChatTransport implements ChatTransport<ChutesUIMessage> {
@@ -78,6 +77,10 @@ export class ChutesChatTransport implements ChatTransport<ChutesUIMessage> {
              part.state === 'output-error' ||
              part.state === 'output-denied')),
       );
+    const selectedModel = config.model;
+    if (!selectedModel) {
+      throw new Error('No Chutes model selected. Wait for model discovery to finish, then choose a model.');
+    }
 
     const toolsEnabled = config.toolsEnabled !== false && !isToolResultContinuation;
     const requestId = crypto.randomUUID();
@@ -243,7 +246,7 @@ export class ChutesChatTransport implements ChatTransport<ChutesUIMessage> {
         disposeAbort = () => abortSignal?.removeEventListener('abort', handleAbort);
 
         window.chutes.chat(requestId, {
-          model: config.model || DEFAULT_MODEL,
+          model: selectedModel,
           messages: toChutesMessages(messages, { ...config, toolsEnabled }),
           stream: true,
           ...(toolsEnabled ? { tools: buildStandardTools(), tool_choice: 'auto' } : {}),

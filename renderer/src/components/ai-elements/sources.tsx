@@ -12,11 +12,12 @@ export type SourceItem = {
 };
 
 type SourcesProps = HTMLAttributes<HTMLDivElement> & {
+  defaultOpen?: boolean;
   sources: SourceItem[];
 };
 
-export function Sources({ sources, className, ...props }: SourcesProps) {
-  const [open, setOpen] = useState(false);
+export function Sources({ sources, defaultOpen = false, className, ...props }: SourcesProps) {
+  const [open, setOpen] = useState(defaultOpen);
   if (sources.length === 0) return null;
 
   return (
