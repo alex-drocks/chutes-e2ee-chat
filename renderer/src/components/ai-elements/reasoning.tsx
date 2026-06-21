@@ -2,7 +2,7 @@
 
 import { Brain, ChevronDown, ChevronUp } from 'lucide-react';
 import type { HTMLAttributes, ReactNode } from 'react';
-import { createContext, useContext, useEffect, useMemo, useState } from 'react';
+import { createContext, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import { Streamdown } from 'streamdown';
 
 import { cn } from '@/lib/utils';
@@ -91,14 +91,34 @@ export function ReasoningTrigger({ className, children, ...props }: ReasoningTri
 
 type ReasoningContentProps = HTMLAttributes<HTMLDivElement>;
 
-export function ReasoningContent({ className, style, children, ...props }: ReasoningContentProps) {
-  const { isOpen, isStreaming } = useReasoningContext();
-  if (!isOpen) return null;
-
+export function ReasoningContent({ className, style, children, onScroll, ...props }: ReasoningContentProps) {
+  const { isOpen, isStreaming, chars } = useReasoningContext();
+  const localRef = useRef<HTMLDivElement | null>(null);
+  const [isAtBottom, setIsAtBottom] = useState(true);
   const markdown = typeof children === 'string' ? children : null;
+
+  useEffect(() => {
+    if (!isOpen || !isAtBottom) return;
+    const el = localRef.current;
+    if (!el) return;
+
+    const frame = window.requestAnimationFrame(() => {
+      el.scrollTo({ top: el.scrollHeight, behavior: 'auto' });
+    });
+
+    return () => window.cancelAnimationFrame(frame);
+  }, [chars, isAtBottom, isOpen]);
+
+  if (!isOpen) return null;
 
   return (
     <div
+      ref={localRef}
+      onScroll={(event) => {
+        const el = event.currentTarget;
+        setIsAtBottom(el.scrollHeight - el.scrollTop - el.clientHeight < 80);
+        onScroll?.(event);
+      }}
       className={cn(
         'overflow-y-auto border-t border-[var(--border)] px-3 py-2 text-xs leading-relaxed text-[var(--text-secondary)]',
         className,
