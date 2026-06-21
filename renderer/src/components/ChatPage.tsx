@@ -144,7 +144,7 @@ function buildWebSearchToolOutput(query: string, result: ChutesWebSearchResponse
   const errors = result.errors ?? Math.max(extractionAttemptedCount - extractedCount, 0);
   const deepSearch = Boolean(result.deepSearch);
   const status = deepSearch
-    ? `Deep search: ${extractedCount}/${extractionAttemptedCount} pages extracted`
+    ? `Deep search: ${extractedCount}/${extractionAttemptedCount} pages read${errors ? `, ${errors} unavailable` : ''}`
     : `Snippet search: ${totalResults} ${totalResults === 1 ? 'result' : 'results'}`;
 
   return {
@@ -169,7 +169,11 @@ function buildWebSearchToolOutput(query: string, result: ChutesWebSearchResponse
       snippetLabel: 'Search result snippet',
       contentSource: item.article ? 'full_page_source_material' : 'search_result_snippet',
       ...(item.article
-        ? { articleLabel: 'Full-page source material extracted from this search result' }
+        ? {
+            articleLabel: item.articleSource === 'direct_fetch'
+              ? 'Full-page source material extracted directly from this search result'
+              : 'Full-page source material extracted via Jina Reader from this search result',
+          }
         : {}),
     })),
 
@@ -1889,7 +1893,7 @@ function SettingsDialog({
             </button>
           </div>
           <p className="text-[11px] text-[var(--text-secondary)] opacity-70">
-            When enabled, search results include full-page markdown extracted via r.jina.ai. Slower but richer answers.
+            When enabled, search results read available page text via Jina Reader first, then a direct no-key fallback. No extra paid provider required.
           </p>
 
           <div className="border-t border-[var(--border)] pt-4">
@@ -2108,7 +2112,7 @@ function getWebSearchSummary(output: unknown): WebSearchSummary | null {
   const status = typeof record.status === 'string'
     ? record.status
     : deepSearch
-      ? `Deep search: ${extractedCount}/${extractionAttemptedCount} pages extracted`
+      ? `Deep search: ${extractedCount}/${extractionAttemptedCount} pages read${errors ? `, ${errors} unavailable` : ''}`
       : `Snippet search: ${totalResults} ${totalResults === 1 ? 'result' : 'results'}`;
 
   return {

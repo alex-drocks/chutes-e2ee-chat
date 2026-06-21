@@ -79,6 +79,7 @@ declare global {
     url: string;
     snippet: string;
     article?: string;
+    articleSource?: 'jina_reader' | 'direct_fetch';
   };
 
   type ChutesWebSearchResponse = {

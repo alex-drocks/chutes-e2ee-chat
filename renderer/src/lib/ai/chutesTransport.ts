@@ -339,7 +339,7 @@ export function buildStandardTools(): ChutesToolDefinition[] {
         name: 'web_search',
         description: (
           'Search the live web for current or source-backed information. ' +
-          'Returns titles, URLs, snippets, and optionally full-page markdown extracted from top results. ' +
+          'Returns titles, URLs, snippets, and, when deep search is enabled, bounded page text from top results. ' +
           'Use this when the user asks for recent, changing, or fact-specific information that your training cutoff does not cover.'
         ),
         parameters: {
