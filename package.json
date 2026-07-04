@@ -1,6 +1,6 @@
 {
   "name": "chutes-e2ee-chat",
-  "version": "0.1.0",
+  "version": "0.0.1",
   "description": "Secure Electron + Next.js chat client for Chutes.ai E2EE inference.",
   "license": "MIT",
   "author": "alex-drocks",
