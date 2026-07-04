@@ -38,7 +38,7 @@
     "build:renderer": "bun run --cwd renderer build",
     "build": "bun run build:renderer",
     "pack": "bun run build && electron-builder --dir",
-    "dist": "bun run build && electron-builder --win --x64",
+    "dist": "bun run build && electron-builder --win --x64 --publish never",
     "start": "node scripts/run-electron.mjs .",
     "test": "bun test",
     "test:ci": "bun test tests/protocol.regression.test.js tests/crypto.unit.test.js tests/retry.unit.test.js tests/discovery.unit.test.js",
