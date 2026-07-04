@@ -11,6 +11,8 @@ Chutes E2EE Chat is a desktop chat client for Chutes.ai confidential inference. 
 - Local encrypted API-key storage through Electron `safeStorage`, with an encrypted fallback.
 - Model discovery, retry handling, web search support, and clipboard image support.
 
+<img width="3826" height="2054" alt="image" src="https://github.com/user-attachments/assets/fe0d43ba-7bed-4d85-85bf-0c7d0d8ee8af" />
+
 ## Security Model
 
 The renderer never receives the saved API key. It calls a narrow preload API, and the Electron main process owns Chutes API calls, encryption, credential storage, and external URL handling.
