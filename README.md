@@ -1,4 +1,4 @@
-﻿# Chutes E2EE Chat
+# Chutes E2EE Chat
 
 Chutes E2EE Chat is a desktop chat client for Chutes.ai confidential inference. It combines an Electron main process, a statically exported Next.js renderer, and a small IPC bridge so encrypted Chutes requests run from Node.js instead of the browser.
 
@@ -87,6 +87,25 @@ Outputs are written to `release/`:
 - `win-unpacked/Chutes E2EE Chat.exe`: unpacked app for debugging. Keep it with the rest of `win-unpacked/`.
 
 `release/` is ignored because these files are generated artifacts.
+
+## GitHub Releases
+
+Release automation lives in `.github/workflows/release.yml`.
+
+Tag-based release:
+
+```bash
+git tag v0.1.1
+git push origin v0.1.1
+```
+
+Manual release:
+
+1. Open the `Release` workflow in GitHub Actions.
+2. Click `Run workflow`.
+3. Choose `patch`, `minor`, or `major`, or enter an exact version.
+
+The release workflow runs the audit and CI test subset, creates the next `vX.Y.Z` tag for manual releases, builds the Windows installer and portable executable with that version, then uploads the generated `.exe` files to a GitHub Release. The Windows executables are currently unsigned, so Windows SmartScreen may warn until a signing certificate is added.
 
 ## Tests
 
