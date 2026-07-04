@@ -1,0 +1,16 @@
+﻿<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-labelledby="title desc">
+  <title id="title">Chutes E2EE Chat icon</title>
+  <desc id="desc">A rounded blue and violet chat tile with a lock.</desc>
+  <defs>
+    <linearGradient id="bg" x1="36" y1="220" x2="220" y2="36" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#19b2d6"/>
+      <stop offset="1" stop-color="#665cff"/>
+    </linearGradient>
+  </defs>
+  <rect x="18" y="18" width="220" height="220" rx="42" fill="#0a101e"/>
+  <rect x="18" y="18" width="220" height="220" rx="42" fill="url(#bg)"/>
+  <path d="M82 72h92a24 24 0 0 1 24 24v40a24 24 0 0 1-24 24h-50l-48 30 16-36H82a24 24 0 0 1-24-24V96a24 24 0 0 1 24-24Z" fill="#fff" fill-opacity=".96"/>
+  <path d="M101 126v-10a27 27 0 0 1 54 0v10" fill="none" stroke="#0a101e" stroke-width="11" stroke-linecap="round"/>
+  <rect x="86" y="126" width="84" height="48" rx="7" fill="#0a101e"/>
+  <circle cx="128" cy="152" r="9" fill="#19b2d6"/>
+</svg>

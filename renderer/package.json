@@ -2,6 +2,7 @@
   "name": "chutes-e2ee-chat-renderer",
   "version": "0.1.0",
   "private": true,
+  "license": "MIT",
   "scripts": {
     "dev": "next dev -p 3000",
     "build": "next build",
@@ -11,10 +12,10 @@
     "@ai-sdk/react": "^3.0.170",
     "ai": "^6.0.168",
     "lucide-react": "^1.11.0",
-    "next": "^16.2.4",
+    "next": "^16.2.10",
     "react": "^19.2.5",
     "react-dom": "^19.2.5",
-    "streamdown": "^1.1.4",
+    "streamdown": "^2.5.0",
     "tailwindcss": "^4.2.4"
   },
   "devDependencies": {
@@ -22,7 +23,7 @@
     "@types/node": "^25.6.0",
     "@types/react": "^19.2.14",
     "autoprefixer": "^10.5.0",
-    "postcss": "^8.5.12",
+    "postcss": "^8.5.16",
     "typescript": "^5.8.3"
   }
 }
