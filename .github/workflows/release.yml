@@ -16,7 +16,7 @@ on:
           - minor
           - major
       version:
-        description: "Optional exact version, without the leading v, for example 0.2.0. Existing tags are reused."
+        description: "Exact version to publish or rebuild, without the leading v. Leave blank to create the next version."
         required: false
         type: string
 
@@ -53,6 +53,18 @@ jobs:
             }
           }
 
+          function Test-GitRef([string] $Ref) {
+            $previousNativeErrorPreference = $PSNativeCommandUseErrorActionPreference
+            $PSNativeCommandUseErrorActionPreference = $false
+            try {
+              git rev-parse -q --verify $Ref *> $null
+              return $LASTEXITCODE -eq 0
+            } finally {
+              $PSNativeCommandUseErrorActionPreference = $previousNativeErrorPreference
+              $global:LASTEXITCODE = 0
+            }
+          }
+
           git fetch --tags --force
 
           $eventName = "${{ github.event_name }}"
@@ -70,7 +82,7 @@ jobs:
               $version = $explicitVersion.TrimStart("v")
               Assert-SemVer $version
               $tag = "v$version"
-              if (-not (git rev-parse -q --verify "refs/tags/$tag")) {
+              if (-not (Test-GitRef "refs/tags/$tag")) {
                 $createTag = "true"
               }
             } else {
@@ -116,7 +128,7 @@ jobs:
 
               $version = "$($latest.major).$($latest.minor).$($latest.patch)"
               $tag = "v$version"
-              if (git rev-parse -q --verify "refs/tags/$tag") {
+              if (Test-GitRef "refs/tags/$tag") {
                 throw "Tag $tag already exists. Use the explicit version input to rebuild an existing release."
               }
               $createTag = "true"
