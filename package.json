@@ -15,6 +15,8 @@
     "dev": "concurrently \"bun run dev:renderer\" \"bun run dev:electron\"",
     "build:renderer": "bun run --cwd renderer build",
     "build": "bun run build:renderer",
+    "pack": "bun run build && electron-builder --dir",
+    "dist": "bun run build && electron-builder --win --x64",
     "start": "node scripts/run-electron.mjs .",
     "test": "bun test",
     "test:ci": "bun test tests/protocol.regression.test.js tests/crypto.unit.test.js tests/retry.unit.test.js tests/discovery.unit.test.js",
@@ -25,13 +27,35 @@
     "electron"
   ],
   "dependencies": {
-    "electron": "^41.3.0",
     "mlkem": "^2.7.0",
     "@stablelib/chacha20poly1305": "^2.0.1"
   },
   "devDependencies": {
+    "electron": "^41.3.0",
     "concurrently": "^9.2.1",
     "dotenv": "^17.4.2",
-    "wait-on": "^9.0.5"
+    "wait-on": "^9.0.5",
+    "electron-builder": "26.0.12"
+  },
+  "build": {
+    "appId": "com.chutes.e2eechat",
+    "productName": "Chutes E2EE Chat",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "electron.js",
+      "preload.js",
+      "lib/**/*",
+      "renderer/dist/**/*",
+      "package.json"
+    ],
+    "win": {
+      "target": [
+        "nsis",
+        "portable"
+      ],
+      "signAndEditExecutable": false
+    }
   }
 }
