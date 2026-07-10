@@ -200,6 +200,7 @@ export default function ChatPage() {
   const [models, setModels] = useState<string[]>([]);
   const [modelsLoading, setModelsLoading] = useState(true);
   const [modelsError, setModelsError] = useState('');
+  const [modelDiscoveryRevision, setModelDiscoveryRevision] = useState(0);
   const [modelMetadata, setModelMetadata] = useState<Record<string, ChutesModelMetadata>>({});
   const [modelStats, setModelStats] = useState<Record<string, ChutesModelStats>>({});
   const [modelStatsLoading, setModelStatsLoading] = useState(false);
@@ -556,7 +557,7 @@ export default function ChatPage() {
     return () => {
       cancelled = true;
     };
-  }, [chooseInitialModel]);
+  }, [chooseInitialModel, modelDiscoveryRevision]);
 
   useEffect(() => {
     if (typeof window === 'undefined' || !window.chutes) return;
@@ -1022,6 +1023,7 @@ export default function ChatPage() {
       const res = await window.chutes.saveApiKey('chutes', apiKey.trim());
       if (res.ok) {
         applyApiKeyStatus(res);
+        setModelDiscoveryRevision((revision) => revision + 1);
         setShowSettings(false);
         setApiKey('');
       } else {

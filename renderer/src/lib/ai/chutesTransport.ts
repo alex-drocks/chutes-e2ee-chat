@@ -94,6 +94,7 @@ export class ChutesChatTransport implements ChatTransport<ChutesUIMessage> {
     let disposeChunk: (() => void) | undefined;
     let disposeError: (() => void) | undefined;
     let disposeAbort: (() => void) | undefined;
+    let requestStarted = false;
 
     return new ReadableStream<UIMessageChunk>({
       start(controller) {
@@ -239,12 +240,24 @@ export class ChutesChatTransport implements ChatTransport<ChutesUIMessage> {
         });
 
         const handleAbort = () => {
-          if (!closed) window.chutes.abort(requestId);
+          if (closed) return;
+          closed = true;
+          cleanup();
+          if (requestStarted) void window.chutes.abort(requestId);
+          controller.error(toAbortError(abortSignal?.reason));
         };
 
         abortSignal?.addEventListener('abort', handleAbort, { once: true });
         disposeAbort = () => abortSignal?.removeEventListener('abort', handleAbort);
 
+        // addEventListener does not replay an abort that happened before the
+        // listener was attached. Avoid starting an unabortable IPC request.
+        if (abortSignal?.aborted) {
+          handleAbort();
+          return;
+        }
+
+        requestStarted = true;
         window.chutes.chat(requestId, {
           model: selectedModel,
           messages: toChutesMessages(messages, { ...config, toolsEnabled }),
@@ -273,7 +286,7 @@ export class ChutesChatTransport implements ChatTransport<ChutesUIMessage> {
       cancel() {
         if (!closed) {
           closed = true;
-          window.chutes.abort(requestId);
+          if (requestStarted) void window.chutes.abort(requestId);
           disposeChunk?.();
           disposeError?.();
           disposeAbort?.();
@@ -285,6 +298,13 @@ export class ChutesChatTransport implements ChatTransport<ChutesUIMessage> {
   async reconnectToStream() {
     return null;
   }
+}
+
+function toAbortError(reason: unknown) {
+  if (reason instanceof Error) return reason;
+  const error = new Error('Request aborted.');
+  error.name = 'AbortError';
+  return error;
 }
 
 export function buildStandardTools(): ChutesToolDefinition[] {

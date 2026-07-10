@@ -179,3 +179,115 @@ test('_maybeRefreshModelMap: concurrent callers share one refresh without duplic
   assert.strictEqual(manager._modelMap.get('model-a'), 'chute-1');
   assert.strictEqual(manager._modelMapRefreshing, null, '_modelMapRefreshing must be cleared');
 });
+
+test('clearNonceCache: an older refresh cannot delete or overwrite its replacement', async () => {
+  const manager = new ChutesDiscoveryManager({ apiKey: 'test' });
+  const refreshes = [];
+  let fetchCount = 0;
+
+  manager._fetchInstances = async () => {
+    fetchCount += 1;
+    return new Promise((resolve) => refreshes.push(resolve));
+  };
+
+  const firstRequest = manager.getNonce('chute-1');
+  manager.clearNonceCache('chute-1');
+  const secondRequest = manager.getNonce('chute-1');
+
+  assert.strictEqual(fetchCount, 2, 'cache invalidation should start a replacement refresh');
+
+  refreshes[0]({
+    nonceExpiresAt: Date.now() + 60_000,
+    instances: [{ instanceId: 'old-inst', e2ePubkey: 'old-key', nonces: ['old-nonce'] }],
+  });
+  const first = await firstRequest;
+  assert.strictEqual(first.nonce, 'old-nonce');
+  assert.strictEqual(
+    manager._nonceRefreshes.has('chute-1'),
+    true,
+    'the older refresh must not remove the replacement in-flight slot',
+  );
+
+  refreshes[1]({
+    nonceExpiresAt: Date.now() + 60_000,
+    instances: [{ instanceId: 'new-inst', e2ePubkey: 'new-key', nonces: ['new-a', 'new-b'] }],
+  });
+  const second = await secondRequest;
+  const cached = await manager.getNonce('chute-1');
+
+  assert.strictEqual(second.nonce, 'new-a');
+  assert.strictEqual(cached.nonce, 'new-b', 'the replacement response should own the cache');
+  assert.strictEqual(fetchCount, 2, 'the remaining replacement nonce should be served from cache');
+});
+
+test('setAuth: invalidates credential-scoped caches and ignores an older model response', async () => {
+  const manager = new ChutesDiscoveryManager({ apiKey: 'old-key' });
+  const originalFetch = globalThis.fetch;
+  let resolveOldFetch;
+  const seenAuth = [];
+  let fetchCount = 0;
+
+  globalThis.fetch = async (_url, init) => {
+    fetchCount += 1;
+    seenAuth.push(init.headers.Authorization);
+    if (fetchCount === 1) {
+      return new Promise((resolve) => {
+        resolveOldFetch = resolve;
+      });
+    }
+
+    return new Response(JSON.stringify({
+      data: [{ id: 'new-model', chute_id: 'new-chute', confidential_compute: true }],
+    }), { status: 200, headers: { 'content-type': 'application/json' } });
+  };
+
+  try {
+    manager._nonceCache.set('old-chute', { instances: [], expiresAt: Date.now() + 60_000 });
+    const oldRefresh = manager._maybeRefreshModelMap();
+
+    manager.setAuth('new-key');
+    assert.strictEqual(manager._nonceCache.size, 0, 'nonce cache should be cleared on credential rotation');
+
+    const newRefresh = manager._maybeRefreshModelMap();
+    resolveOldFetch(new Response(JSON.stringify({
+      data: [{ id: 'old-model', chute_id: 'old-chute', confidential_compute: true }],
+    }), { status: 200, headers: { 'content-type': 'application/json' } }));
+
+    await Promise.all([oldRefresh, newRefresh]);
+
+    assert.deepStrictEqual(seenAuth, ['Bearer old-key', 'Bearer new-key']);
+    assert.strictEqual(manager._modelMap.has('old-model'), false);
+    assert.strictEqual(manager._modelMap.get('new-model'), 'new-chute');
+    assert.deepStrictEqual(manager.getAuth(), { Authorization: 'Bearer new-key' });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('model discovery: does not coerce a string confidential flag to true', async () => {
+  const manager = new ChutesDiscoveryManager({ apiKey: 'test' });
+  const originalFetch = globalThis.fetch;
+
+  globalThis.fetch = async () => new Response(JSON.stringify({
+    data: [{
+      id: 'not-actually-confidential',
+      chute_id: 'chute-1',
+      confidential_compute: 'false',
+      input_modalities: ['text'],
+      output_modalities: ['text'],
+    }],
+  }), { status: 200, headers: { 'content-type': 'application/json' } });
+
+  try {
+    await assert.rejects(
+      manager.resolveE2EEChuteId('not-actually-confidential'),
+      /not advertised as a confidential-compute text model/,
+    );
+    assert.strictEqual(
+      manager._modelMeta.get('not-actually-confidential').confidentialCompute,
+      false,
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});

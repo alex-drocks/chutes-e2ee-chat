@@ -487,14 +487,28 @@ async function getApiKeyStatus() {
 // ---------------------------------------------------------------------------
 
 let transport = null;
+let transportLoading = null;
 
 async function getTransport() {
   if (transport) return transport;
 
-  const creds = await loadCredentials();
-  const apiKey = creds.chutesApiKey || '';
-  transport = new ChutesE2EETransport({ apiKey, modelsBase: DEFAULT_MODELS_BASE });
-  return transport;
+  if (!transportLoading) {
+    transportLoading = loadCredentials()
+      .then((creds) => {
+        // setApiKey() may have created a newer transport while credentials were
+        // loading. Never overwrite it with the stale read.
+        if (!transport) {
+          const apiKey = creds.chutesApiKey || '';
+          transport = new ChutesE2EETransport({ apiKey, modelsBase: DEFAULT_MODELS_BASE });
+        }
+        return transport;
+      })
+      .finally(() => {
+        transportLoading = null;
+      });
+  }
+
+  return transportLoading;
 }
 
 function setApiKey(apiKey) {
@@ -1142,7 +1156,7 @@ function isReadableContentType(contentType) {
 }
 
 function buildJinaReaderUrl(safeUrl) {
-  return 'https://r.jina.ai/http://' + String(safeUrl).replace(/[\r\n]/g, '');
+  return 'https://r.jina.ai/' + String(safeUrl).replace(/[\r\n]/g, '');
 }
 
 async function assertSafeResolvedUrl(safeUrl) {
