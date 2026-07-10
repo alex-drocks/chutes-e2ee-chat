@@ -18,7 +18,11 @@ declare global {
       abort: (requestId: string) => Promise<{ ok: boolean; error?: string }>;
       models: () => Promise<{ ok: boolean; models?: string[]; metadata?: ChutesModelMetadata[]; error?: string }>;
       modelStats: () => Promise<{ ok: boolean; stats?: Record<string, ChutesModelStats>; error?: string }>;
-      webSearch: (query: string, deepSearch?: boolean) => Promise<ChutesWebSearchResponse>;
+      webSearch: (
+        query: string,
+        deepSearch?: boolean,
+        options?: ChutesWebSearchOptions,
+      ) => Promise<ChutesWebSearchResponse>;
       clipboardImage: () => Promise<{ ok: boolean; hasImage?: boolean; dataUrl?: string; mimeType?: string; size?: number; source?: string; error?: string }>;
       onStreamChunk: (callback: (payload: { requestId: string; data?: string; done?: boolean }) => void) => () => void;
       onStreamError: (callback: (payload: { requestId: string; error: string }) => void) => () => void;
@@ -75,11 +79,23 @@ declare global {
   };
 
   type ChutesWebSearchResult = {
+    sourceId: string;
     title: string;
     url: string;
     snippet: string;
+    sourceType?: 'official' | 'academic' | 'targeted' | 'reference' | 'community' | 'general';
+    sourceQueries?: string[];
+    queryMatches?: number;
+    rankScore?: number;
+    publishedAt?: string;
+    extractionStatus?: 'full_page' | 'snippet_only' | 'unavailable';
     article?: string;
     articleSource?: 'jina_reader' | 'direct_fetch';
+  };
+
+  type ChutesWebSearchOptions = {
+    queries?: string[];
+    recency?: 'auto' | 'none' | 'day' | 'week' | 'month' | 'year';
   };
 
   type ChutesWebSearchResponse = {
@@ -88,6 +104,11 @@ declare global {
     fetchedAt?: string;
     provider?: string;
     deepSearch?: boolean;
+    searchedQueries?: string[];
+    queryCount?: number;
+    recency?: 'none' | 'day' | 'week' | 'month' | 'year';
+    fallbackUsed?: boolean;
+    searchErrors?: number;
     extractedCount?: number;
     extractionAttemptedCount?: number;
     totalResults?: number;

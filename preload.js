@@ -26,8 +26,9 @@ const chutesAPI = {
   /** Get cached public LLM model stats. */
   modelStats: () => ipcRenderer.invoke('chutes:modelStats'),
 
-  /** Run a lightweight web search from the main process. */
-  webSearch: (query, deepSearch = false) => ipcRenderer.invoke('chutes:webSearch', { query, deepSearch }),
+  /** Run a bounded multi-source web search from the main process. */
+  webSearch: (query, deepSearch = false, options = {}) =>
+    ipcRenderer.invoke('chutes:webSearch', { ...options, query, deepSearch }),
 
   /** Read a screenshot/image from the native clipboard when paste events do not expose files. */
   clipboardImage: () => ipcRenderer.invoke('chutes:clipboardImage'),

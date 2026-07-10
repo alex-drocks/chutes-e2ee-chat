@@ -17,6 +17,13 @@ import { promisify } from 'node:util';
 
 import { ChutesE2EETransport } from './lib/chutes/ChutesE2EETransport.js';
 import { DEFAULT_API_BASE, DEFAULT_MODELS_BASE } from './lib/chutes/constants.js';
+import {
+  aggregateSearchResults,
+  duckDuckGoDateCode,
+  normalizeSearchQueries,
+  resolveSearchRecency,
+  selectDiverseResults,
+} from './lib/web/WebResearch.js';
 
 const require = createRequire(import.meta.url);
 const { app, BrowserWindow, clipboard, ipcMain, net, protocol, safeStorage, shell } = require('electron');
@@ -34,12 +41,14 @@ const CHAT_FALLBACK_MAX_ATTEMPTS = 3;
 const CHAT_FALLBACK_MAX_UTILIZATION = 0.9;
 const CHAT_FALLBACK_MAX_RATE_LIMIT_RATIO_5M = 0.25;
 const WEB_CONTENT_CACHE_TTL_MS = 5 * 60 * 1000;
-const WEB_SEARCH_MAX_RESULTS = 6;
+const WEB_SEARCH_RESULTS_PER_QUERY = 6;
+const WEB_SEARCH_MAX_RESULTS = 8;
+const WEB_SEARCH_MAX_QUERIES = 3;
 const DIRECT_PAGE_RESPONSE_MAX_BYTES = 768 * 1024;
-const WEB_ARTICLE_MAX_CHARS = 12_000;
+const WEB_ARTICLE_MAX_CHARS = 9_000;
 const WEB_CONTENT_FETCH_TIMEOUT_MS = 8_000;
 const WEB_CONTENT_MAX_REDIRECTS = 3;
-const WEB_CONTENT_MAX_CONCURRENT = 3;
+const WEB_CONTENT_MAX_CONCURRENT = 4;
 const WEB_RESPONSE_MAX_BYTES = 5 * 1024 * 1024;   // 5 MB — cap raw HTML from search engine
 const JINA_RESPONSE_MAX_BYTES = 1 * 1024 * 1024;    // 1 MB — cap extracted article text
 const MAX_REQUEST_ID_LENGTH = 128;
@@ -1043,7 +1052,7 @@ function normalizeDuckDuckGoUrl(value) {
   }
 }
 
-function parseDuckDuckGoLiteResults(html) {
+function parseDuckDuckGoResults(html) {
   const rawResults = [];
   let match;
 
@@ -1051,7 +1060,8 @@ function parseDuckDuckGoLiteResults(html) {
   while ((match = anchorRe.exec(html)) !== null) {
     const attrs = match[1] || '';
     const className = getHtmlAttribute(attrs, 'class');
-    if (!className.split(/\s+/).includes('result-link')) continue;
+    const classes = className.split(/\s+/);
+    if (!classes.includes('result-link') && !classes.includes('result__a')) continue;
 
     const href = getHtmlAttribute(attrs, 'href');
     const title = htmlFragmentToText(match[2]);
@@ -1063,7 +1073,8 @@ function parseDuckDuckGoLiteResults(html) {
   const snippetRe = /<(?:td|a|div|span)\b([^>]*)>([\s\S]*?)<\/(?:td|a|div|span)>/gi;
   while ((match = snippetRe.exec(html)) !== null) {
     const className = getHtmlAttribute(match[1], 'class');
-    if (!className.split(/\s+/).includes('result-snippet')) continue;
+    const classes = className.split(/\s+/);
+    if (!classes.includes('result-snippet') && !classes.includes('result__snippet')) continue;
     const snippet = htmlFragmentToText(match[2]);
     if (snippet) snippets.push(snippet);
   }
@@ -1086,6 +1097,31 @@ function parseDuckDuckGoLiteResults(html) {
   }
 
   return results;
+}
+
+async function searchDuckDuckGo(query, recency, variant = 'lite') {
+  const body = new URLSearchParams();
+  body.append('q', query);
+  const dateCode = duckDuckGoDateCode(recency);
+  if (dateCode) body.append('df', dateCode);
+
+  const endpoint = variant === 'html'
+    ? 'https://html.duckduckgo.com/html/'
+    : 'https://lite.duckduckgo.com/lite/';
+  const response = await fetch(endpoint, {
+    method: 'POST',
+    signal: AbortSignal.timeout(12_000),
+    headers: {
+      accept: 'text/html',
+      'content-type': 'application/x-www-form-urlencoded',
+      'user-agent': 'ChutesE2EEChat/1.0',
+    },
+    body: body.toString(),
+  });
+
+  if (!response.ok) throw new Error(`DuckDuckGo ${variant} search failed: HTTP ${response.status}`);
+  const html = await readWithLengthLimit(response, WEB_RESPONSE_MAX_BYTES, `DuckDuckGo ${variant}`);
+  return parseDuckDuckGoResults(html).slice(0, WEB_SEARCH_RESULTS_PER_QUERY);
 }
 
 function compactExtractedContent(value) {
@@ -1182,11 +1218,16 @@ async function assertSafeResolvedUrl(safeUrl) {
 /** In-memory cache for extracted page content. */
 let webContentCache = new Map();
 
-async function fetchJinaContent(url, timeoutMs = WEB_CONTENT_FETCH_TIMEOUT_MS) {
+async function fetchJinaContent(url, timeoutMs = WEB_CONTENT_FETCH_TIMEOUT_MS, bypassCache = false) {
   const safeUrl = normalizeSafeExternalHttpUrl(url);
+  const headers = {
+    accept: 'text/markdown, text/plain, */*',
+    'x-retain-images': 'none',
+  };
+  if (bypassCache) headers['x-no-cache'] = 'true';
   const res = await fetch(buildJinaReaderUrl(safeUrl), {
     signal: AbortSignal.timeout(timeoutMs),
-    headers: { accept: 'text/markdown, text/plain, */*' },
+    headers,
   });
   if (!res.ok) return null;
 
@@ -1223,18 +1264,18 @@ async function fetchDirectReadableContent(url, timeoutMs = WEB_CONTENT_FETCH_TIM
     : compactExtractedContent(text);
 }
 
-async function fetchDeepSearchContent(url, timeoutMs = WEB_CONTENT_FETCH_TIMEOUT_MS) {
+async function fetchDeepSearchContent(url, timeoutMs = WEB_CONTENT_FETCH_TIMEOUT_MS, bypassCache = false) {
   const safeUrl = normalizeSafeExternalHttpUrl(url);
   const cached = webContentCache.get(safeUrl);
   const now = Date.now();
-  if (cached && now - cached.loadedAt < WEB_CONTENT_CACHE_TTL_MS) {
+  if (!bypassCache && cached && now - cached.loadedAt < WEB_CONTENT_CACHE_TTL_MS) {
     return { content: cached.content, source: cached.source };
   }
 
   let content = null;
   let source = 'jina_reader';
   try {
-    content = await fetchJinaContent(safeUrl, timeoutMs);
+    content = await fetchJinaContent(safeUrl, timeoutMs, bypassCache);
   } catch {
     content = null;
   }
@@ -1387,87 +1428,123 @@ ipcMain.handle('chutes:models', async (event) => {
 ipcMain.handle('chutes:webSearch', async (event, payload = {}) => {
   const nowIso = new Date().toISOString();
   let requestedDeepSearch = false;
+  let searchedQueries = [];
+  let effectiveRecency = 'none';
   try {
     assertTrustedSender(event);
-    const { query, deepSearch = false } = payload || {};
+    const { query, queries = [], deepSearch = false, recency = 'auto' } = payload || {};
     requestedDeepSearch = Boolean(deepSearch);
-    const normalizedQuery = typeof query === 'string' ? query.trim() : '';
-    if (!normalizedQuery) {
+    searchedQueries = normalizeSearchQueries(query, queries, WEB_SEARCH_MAX_QUERIES);
+    if (searchedQueries.length === 0) {
       return {
         ok: false, error: 'Search query is required.', results: [],
         fetchedAt: nowIso, provider: 'DuckDuckGo', deepSearch: requestedDeepSearch,
-        extractedCount: 0, extractionAttemptedCount: 0, totalResults: 0, errors: 0,
+        searchedQueries: [], queryCount: 0, recency: 'none', fallbackUsed: false,
+        extractedCount: 0, extractionAttemptedCount: 0, totalResults: 0, errors: 0, searchErrors: 0,
       };
     }
+    effectiveRecency = resolveSearchRecency(recency, searchedQueries);
 
-    const searchUrl = 'https://lite.duckduckgo.com/lite/';
-    const body = new URLSearchParams();
-    body.append('q', normalizedQuery);
-
-    const response = await fetch(searchUrl, {
-      method: 'POST',
-      signal: AbortSignal.timeout(12_000),
-      headers: {
-        accept: 'text/html',
-        'content-type': 'application/x-www-form-urlencoded',
-        'user-agent': 'ChutesE2EEChat/1.0',
-      },
-      body: body.toString(),
-    });
-
-    if (!response.ok) {
-      return {
-        ok: false, error: 'Search failed: HTTP ' + response.status, results: [],
-        fetchedAt: nowIso, provider: 'DuckDuckGo', deepSearch: requestedDeepSearch,
-        extractedCount: 0, extractionAttemptedCount: 0, totalResults: 0, errors: 0,
-      };
+    const settledSearches = await Promise.allSettled(
+      searchedQueries.map(async (searchQuery) => ({
+        query: searchQuery,
+        results: await searchDuckDuckGo(searchQuery, effectiveRecency),
+      })),
+    );
+    const resultGroups = [];
+    const searchFailures = [];
+    for (const settled of settledSearches) {
+      if (settled.status === 'fulfilled') {
+        if (settled.value.results.length > 0) resultGroups.push(settled.value);
+      } else {
+        searchFailures.push(getErrorMessage(settled.reason));
+      }
     }
 
-    const html = await readWithLengthLimit(response, WEB_RESPONSE_MAX_BYTES, 'DuckDuckGo');
-    const results = parseDuckDuckGoLiteResults(html).slice(0, WEB_SEARCH_MAX_RESULTS);
-
-    if (results.length === 0) {
-      return {
-        ok: true, results: [], fetchedAt: nowIso, provider: 'DuckDuckGo',
-        deepSearch: requestedDeepSearch, extractedCount: 0, extractionAttemptedCount: 0, totalResults: 0, errors: 0,
-      };
+    let fallbackUsed = false;
+    let provider = 'DuckDuckGo';
+    if (resultGroups.length === 0) {
+      try {
+        const fallbackResults = await searchDuckDuckGo(searchedQueries[0], effectiveRecency, 'html');
+        if (fallbackResults.length > 0) {
+          resultGroups.push({ query: searchedQueries[0], results: fallbackResults });
+          fallbackUsed = true;
+          provider = 'DuckDuckGo HTML fallback';
+        }
+      } catch (err) {
+        searchFailures.push(getErrorMessage(err));
+      }
     }
+
+    const results = aggregateSearchResults(resultGroups, WEB_SEARCH_MAX_RESULTS).map((result) => ({
+      ...result,
+      extractionStatus: result.article ? 'full_page' : 'snippet_only',
+    }));
 
     const baseResponse = {
       ok: true,
       results,
       fetchedAt: nowIso,
-      provider: 'DuckDuckGo',
+      provider,
       deepSearch: requestedDeepSearch,
       totalResults: results.length,
+      searchedQueries,
+      queryCount: searchedQueries.length,
+      recency: effectiveRecency,
+      fallbackUsed,
+      searchErrors: searchFailures.length,
     };
+
+    if (results.length === 0) {
+      const allPrimarySearchesFailed = settledSearches.every((item) => item.status === 'rejected');
+      return {
+        ...baseResponse,
+        ok: !allPrimarySearchesFailed,
+        ...(allPrimarySearchesFailed ? { error: searchFailures[0] || 'Web search failed.' } : {}),
+        extractedCount: 0,
+        extractionAttemptedCount: 0,
+        errors: 0,
+      };
+    }
 
     if (!requestedDeepSearch) {
       return { ...baseResponse, extractedCount: 0, extractionAttemptedCount: 0, errors: 0 };
     }
 
     pruneWebContentCache();
-    const limit = Math.min(results.length, WEB_CONTENT_MAX_CONCURRENT);
+    const candidates = selectDiverseResults(results, WEB_CONTENT_MAX_CONCURRENT);
+    const bypassCache = effectiveRecency !== 'none';
     let extractedCount = 0;
     let errorCount = 0;
     const extracted = await Promise.all(
-      results.slice(0, limit).map(async (result, index) => {
+      candidates.map(async (result) => {
+        if (result.article) {
+          return { sourceId: result.sourceId, content: result.article, source: result.articleSource || 'jina_reader' };
+        }
         try {
-          const extraction = await fetchDeepSearchContent(result.url, WEB_CONTENT_FETCH_TIMEOUT_MS);
-          if (!extraction?.content) return { index, error: true };
-          return { index, content: extraction.content, source: extraction.source };
+          const extraction = await fetchDeepSearchContent(
+            result.url,
+            WEB_CONTENT_FETCH_TIMEOUT_MS,
+            bypassCache,
+          );
+          if (!extraction?.content) return { sourceId: result.sourceId, error: true };
+          return { sourceId: result.sourceId, content: extraction.content, source: extraction.source };
         } catch {
-          return { index, error: true };
+          return { sourceId: result.sourceId, error: true };
         }
       }),
     );
 
     for (const item of extracted) {
+      const result = results.find((candidate) => candidate.sourceId === item.sourceId);
+      if (!result) continue;
       if (item.content) {
-        results[item.index].article = item.content;
-        results[item.index].articleSource = item.source;
+        result.article = item.content;
+        result.articleSource = item.source;
+        result.extractionStatus = 'full_page';
         extractedCount += 1;
       } else {
+        result.extractionStatus = 'unavailable';
         errorCount += 1;
       }
     }
@@ -1475,14 +1552,16 @@ ipcMain.handle('chutes:webSearch', async (event, payload = {}) => {
     return {
       ...baseResponse,
       extractedCount,
-      extractionAttemptedCount: limit,
+      extractionAttemptedCount: candidates.length,
       errors: errorCount,
     };
   } catch (err) {
     return {
       ok: false, error: getErrorMessage(err), results: [],
       fetchedAt: nowIso, provider: 'DuckDuckGo',
-      deepSearch: requestedDeepSearch, extractedCount: 0, extractionAttemptedCount: 0, totalResults: 0, errors: 0,
+      deepSearch: requestedDeepSearch, searchedQueries, queryCount: searchedQueries.length,
+      recency: effectiveRecency, fallbackUsed: false, searchErrors: 0,
+      extractedCount: 0, extractionAttemptedCount: 0, totalResults: 0, errors: 0,
     };
   }
 });
