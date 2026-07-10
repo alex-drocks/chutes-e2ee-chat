@@ -2,6 +2,8 @@
 
 Chutes E2EE Chat is a desktop chat client for Chutes.ai confidential inference. It combines an Electron main process, a statically exported Next.js renderer, and a small IPC bridge so encrypted Chutes requests run from Node.js instead of the browser.
 
+If you prefer Go + Wails: https://github.com/alex-drocks/chutes-e2ee-chat-go
+
 ## Features
 
 - Electron desktop app with a Next.js and Tailwind renderer.
