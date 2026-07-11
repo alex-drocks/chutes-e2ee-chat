@@ -10,7 +10,7 @@
   },
   "dependencies": {
     "@ai-sdk/react": "^4.0.20",
-    "ai": "^6.0.222",
+    "ai": "^7.0.22",
     "lucide-react": "^1.24.0",
     "next": "^16.2.10",
     "react": "^19.2.7",
