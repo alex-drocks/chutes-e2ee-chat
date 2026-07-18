@@ -190,7 +190,7 @@ jobs:
           git push origin "${{ steps.version.outputs.tag }}"
 
       - name: Publish GitHub Release
-        uses: softprops/action-gh-release@v3.0.1
+        uses: softprops/action-gh-release@v3.0.2
         with:
           tag_name: ${{ steps.version.outputs.tag }}
           name: Chutes E2EE Chat ${{ steps.version.outputs.tag }}
