@@ -365,15 +365,16 @@ export default function ChatPage() {
         return;
       }
 
-      let result: Awaited<ReturnType<typeof window.chutes.webSearch>>;
+      let result: Awaited<ReturnType<typeof window.chutes.webSearch>> | undefined;
       try {
-        result = await window.chutes.webSearch(query, deepSearchEnabled, {
+        result = await toolResultScopeRef.current.waitFor(window.chutes.webSearch(query, deepSearchEnabled, {
           queries: Array.isArray(input?.queries) ? input.queries : undefined,
           recency: input?.recency,
-        });
+        }));
       } catch (err: unknown) {
         result = { ok: false, error: getErrorMessage(err, 'Web search failed.') };
       }
+      if (!result) return;
       submitToolOutput({
         tool: 'web_search',
         toolCallId: toolCall.toolCallId,

@@ -145,15 +145,16 @@ test('stopping an AI SDK chat aborts its IPC request and releases listeners', as
 });
 
 for (const outcome of ['success', 'error'] as const) {
-  test(`a stopped chat ignores a delayed tool ${outcome}`, async () => {
+  test(`a stopped chat ignores a delayed tool ${outcome} and accepts a follow-up message`, async () => {
     const scope = new ToolResultScope();
     const toolStarted = Promise.withResolvers<void>();
     const toolFinished = Promise.withResolvers<void>();
     const bridge = mockBridge((id, index) => {
       if (index === 0) {
+        if (outcome === 'success') bridge.delta(id, { content: 'Searching.' });
         bridge.delta(id, { tool_calls: [{ index: 0, id: 'slow-search', type: 'function', function: { name: 'web_search', arguments: '{"query":"test"}' } }] });
       } else {
-        bridge.delta(id, { content: 'This request should never start.' });
+        bridge.delta(id, { content: 'Follow-up answer.' });
       }
       bridge.finish(id);
     });
@@ -163,7 +164,7 @@ for (const outcome of ['success', 'error'] as const) {
       onToolCall: async ({ toolCall }) => {
         const submit = scope.bind(chat.addToolOutput);
         toolStarted.resolve();
-        await toolFinished.promise;
+        await scope.waitFor(toolFinished.promise);
         // Do not await addToolOutput inside onToolCall: the SDK serializes these jobs.
         void submit({
           tool: 'web_search', toolCallId: toolCall.toolCallId,
@@ -179,7 +180,6 @@ for (const outcome of ['success', 'error'] as const) {
 
     scope.cancel();
     await chat.stop();
-    toolFinished.resolve();
     await sending;
     // Drain the SDK's queued addToolOutput/automatic continuation work too.
     await new Promise(resolve => setTimeout(resolve, 0));
@@ -190,8 +190,47 @@ for (const outcome of ['success', 'error'] as const) {
     const tool = chat.messages.at(-1)?.parts.find(p => p.type === 'tool-web_search');
     assert.equal(tool?.state, 'input-available');
     assert.equal(bridge.listeners, 0);
+
+    scope.begin();
+    await chat.sendMessage({ text: 'Answer without searching' });
+
+    assert.equal(bridge.calls.length, 2);
+    const history = bridge.calls[1]![1].messages;
+    assert.ok(history.every(m => !m.tool_calls?.length && m.role !== 'tool'), 'cancelled tools must not become orphan API calls');
+    assert.deepEqual(history.filter(m => m.role === 'assistant'),
+      outcome === 'success' ? [{ role: 'assistant', content: 'Searching.' }] : []);
+    assert.equal(chat.error, undefined);
+    assert.equal(chat.status, 'ready');
+    assert.ok(chat.messages.at(-1)?.parts.some(p => p.type === 'text' && p.text === 'Follow-up answer.'));
+    assert.equal(bridge.listeners, 0);
+
+    if (outcome === 'success') toolFinished.resolve();
+    else toolFinished.reject(new Error('Search failed after Stop'));
+    await new Promise(resolve => setTimeout(resolve, 0));
+    assert.equal(bridge.calls.length, 2, 'settling the old search must not start another request');
   });
 }
+
+test('pending tools do not discard completed tool results in the same message', async () => {
+  const bridge = mockBridge(id => bridge.finish(id));
+  const chat = new Chat<ChutesUIMessage>({
+    transport: transport(),
+    messages: [
+      { id: 'question', role: 'user', parts: [{ type: 'text', text: 'Search twice' }] },
+      { id: 'tools', role: 'assistant', parts: [
+        { type: 'tool-web_search', toolCallId: 'complete', state: 'output-available', input: { query: 'first' }, output: { ok: true } },
+        { type: 'tool-web_search', toolCallId: 'pending', state: 'input-available', input: { query: 'second' } },
+      ] },
+    ],
+  });
+
+  await chat.sendMessage({ text: 'Use the first result' });
+
+  const history = bridge.calls[0]![1].messages;
+  assert.deepEqual(history.find(m => m.role === 'assistant')?.tool_calls?.map(call => call.id), ['complete']);
+  assert.deepEqual(history.filter(m => m.role === 'tool').map(m => [m.tool_call_id, m.content]), [['complete', '{"ok":true}']]);
+  assert.equal(chat.error, undefined);
+});
 
 test('a new chat cannot accept a delayed result from the previous run', async () => {
   const scope = new ToolResultScope();
@@ -211,7 +250,7 @@ test('a new chat cannot accept a delayed result from the previous run', async ()
     onToolCall: async ({ toolCall }) => {
       const submit = scope.bind(chat.addToolOutput);
       toolStarted.resolve();
-      await toolFinished.promise;
+      await scope.waitFor(toolFinished.promise);
       void submit({ tool: 'web_search', toolCallId: toolCall.toolCallId, output: { stale: true } });
     },
   });
@@ -224,8 +263,8 @@ test('a new chat cannot accept a delayed result from the previous run', async ()
   chat.messages = [];
   scope.begin();
   const newSending = chat.sendMessage({ text: 'New question' });
-  toolFinished.resolve();
   await Promise.all([oldSending, newSending]);
+  toolFinished.resolve();
   await new Promise(resolve => setTimeout(resolve, 0));
 
   assert.equal(bridge.calls.length, 2);
@@ -253,7 +292,7 @@ test('an active chat still continues after an asynchronous tool completes', asyn
     sendAutomaticallyWhen: options => scope.active && lastAssistantMessageIsCompleteWithToolCalls(options),
     onToolCall: async ({ toolCall }) => {
       const submit = scope.bind(chat.addToolOutput);
-      await new Promise(resolve => setTimeout(resolve, 0));
+      await scope.waitFor(new Promise(resolve => setTimeout(resolve, 0)));
       void submit({ tool: 'web_search', toolCallId: toolCall.toolCallId, output: { ok: true } });
     },
   });

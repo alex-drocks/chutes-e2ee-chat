@@ -20,6 +20,23 @@ export class ToolResultScope {
     this.controller.abort();
   }
 
+  /** Release the SDK's tool handler on Stop, even if its IPC work is still pending. */
+  async waitFor<T>(operation: Promise<T>): Promise<T | undefined> {
+    const { signal } = this.controller;
+    let cleanup = () => {};
+    const cancelled = new Promise<undefined>((resolve) => {
+      const onAbort = () => resolve(undefined);
+      cleanup = () => signal.removeEventListener('abort', onAbort);
+      if (signal.aborted) onAbort();
+      else signal.addEventListener('abort', onAbort, { once: true });
+    });
+    try {
+      return await Promise.race([operation, cancelled]);
+    } finally {
+      cleanup();
+    }
+  }
+
   bind(submit: AddToolOutput): AddToolOutput {
     const { signal } = this.controller;
     return (output) => {
