@@ -41,7 +41,7 @@
     "dist": "bun run build && electron-builder --win --x64 --publish never",
     "start": "node scripts/run-electron.mjs .",
     "test": "bun test",
-    "test:ci": "bun test tests/protocol.regression.test.js tests/crypto.unit.test.js tests/retry.unit.test.js tests/discovery.unit.test.js tests/web-research.unit.test.js tests/live-runner.unit.test.js renderer/tests/chutes-transport.test.ts",
+    "test:ci": "bun test tests/protocol.regression.test.js tests/crypto.unit.test.js tests/retry.unit.test.js tests/discovery.unit.test.js tests/web-research.unit.test.js tests/live-runner.unit.test.js tests/release-workflow.unit.test.js renderer/tests/chutes-transport.test.ts",
     "test:unit": "bun run test:ci",
     "test:live": "RUN_LIVE_TESTS=1 bun test --timeout 30000 --max-concurrency=1 tests/e2ee-integration.test.js tests/e2ee-comprehensive.test.js tests/e2ee-stress.test.js tests/cors-free.test.js"
   },

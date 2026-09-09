@@ -2,6 +2,8 @@ name: Release
 
 on:
   push:
+    branches:
+      - main
     tags:
       - "v*"
   workflow_dispatch:
@@ -16,7 +18,7 @@ on:
           - minor
           - major
       version:
-        description: "Exact version to publish or rebuild, without the leading v. Leave blank to create the next version."
+        description: "Exact unpublished version, without the leading v. Leave blank to create the next version."
         required: false
         type: string
 
@@ -24,7 +26,8 @@ permissions:
   contents: write
 
 concurrency:
-  group: release-${{ github.ref }}
+  # Serialize version allocation and publication across main, tags, and manual runs.
+  group: release
   cancel-in-progress: false
 
 jobs:
@@ -51,6 +54,12 @@ jobs:
       - name: Resolve release version
         id: version
         shell: pwsh
+        env:
+          RELEASE_EVENT: ${{ github.event_name }}
+          RELEASE_REF_TYPE: ${{ github.ref_type }}
+          RELEASE_REF_NAME: ${{ github.ref_name }}
+          RELEASE_INPUT_VERSION: ${{ inputs.version }}
+          RELEASE_INPUT_BUMP: ${{ inputs.bump }}
         run: |
           function Assert-SemVer([string] $Version) {
             if ($Version -notmatch '^\d+\.\d+\.\d+$') {
@@ -71,18 +80,20 @@ jobs:
           }
 
           git fetch --tags --force
+          if ($LASTEXITCODE -ne 0) {
+            throw "Could not refresh release tags. Refusing to choose a version from stale data."
+          }
 
-          $eventName = "${{ github.event_name }}"
           $createTag = "false"
 
-          if ($eventName -eq "push") {
-            $tag = "${{ github.ref_name }}"
+          if ($env:RELEASE_EVENT -eq "push" -and $env:RELEASE_REF_TYPE -eq "tag") {
+            $tag = $env:RELEASE_REF_NAME
             if ($tag -notmatch '^v(\d+\.\d+\.\d+)$') {
               throw "Release tags must look like v0.1.0."
             }
             $version = $Matches[1]
           } else {
-            $explicitVersion = "${{ github.event.inputs.version }}".Trim()
+            $explicitVersion = "$env:RELEASE_INPUT_VERSION".Trim()
             if ($explicitVersion) {
               $version = $explicitVersion.TrimStart("v")
               Assert-SemVer $version
@@ -116,7 +127,8 @@ jobs:
                 }
               }
 
-              switch ("${{ github.event.inputs.bump }}") {
+              # Pushes to main have no inputs and therefore use a patch bump.
+              switch ($env:RELEASE_INPUT_BUMP) {
                 "major" {
                   $latest.major += 1
                   $latest.minor = 0
@@ -134,7 +146,7 @@ jobs:
               $version = "$($latest.major).$($latest.minor).$($latest.patch)"
               $tag = "v$version"
               if (Test-GitRef "refs/tags/$tag") {
-                throw "Tag $tag already exists. Use the explicit version input to rebuild an existing release."
+                throw "Tag $tag already exists. Choose a new version or retry an unpublished draft."
               }
               $createTag = "true"
             }
@@ -169,11 +181,22 @@ jobs:
 
       - name: List release files
         shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
         run: |
-          Get-ChildItem -Path release -Recurse -File | Select-Object FullName, Length | Format-Table -AutoSize
-          if (-not (Get-ChildItem -Path release -Filter *.exe -File)) {
-            throw "No Windows executable files were produced in release/."
+          $expectedFiles = @(
+            "Chutes E2EE Chat $env:RELEASE_VERSION.exe",
+            "Chutes E2EE Chat Setup $env:RELEASE_VERSION.exe",
+            "Chutes E2EE Chat Setup $env:RELEASE_VERSION.exe.blockmap",
+            "latest.yml"
+          )
+          foreach ($name in $expectedFiles) {
+            $file = Get-Item -LiteralPath (Join-Path release $name) -ErrorAction SilentlyContinue
+            if (-not $file -or $file.PSIsContainer -or $file.Length -eq 0) {
+              throw "Missing or empty release asset: $name. Refusing to publish an incomplete release."
+            }
           }
+          Get-ChildItem -Path release -File | Select-Object Name, Length | Format-Table -AutoSize
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v7.0.1
