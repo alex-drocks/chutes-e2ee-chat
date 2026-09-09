@@ -194,14 +194,53 @@ jobs:
           git tag -a "${{ steps.version.outputs.tag }}" -m "Release ${{ steps.version.outputs.tag }}"
           git push origin "${{ steps.version.outputs.tag }}"
 
+      - name: Ensure draft GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
+          RELEASE_NAME: Chutes E2EE Chat ${{ steps.version.outputs.tag }}
+        run: |
+          $previousNativeErrorPreference = $PSNativeCommandUseErrorActionPreference
+          $PSNativeCommandUseErrorActionPreference = $false
+          try {
+            $existingRelease = gh release view $env:RELEASE_TAG --json isDraft 2>$null
+            $releaseExists = $LASTEXITCODE -eq 0
+          } finally {
+            $PSNativeCommandUseErrorActionPreference = $previousNativeErrorPreference
+            $global:LASTEXITCODE = 0
+          }
+
+          if ($releaseExists) {
+            $release = $existingRelease | ConvertFrom-Json
+            if (-not $release.isDraft) {
+              throw "Release $env:RELEASE_TAG is already published. Immutable GitHub releases cannot accept new or replacement assets after publication, so rebuild the release under a new version."
+            }
+          } else {
+            gh release create $env:RELEASE_TAG --draft --title $env:RELEASE_NAME --generate-notes
+          }
+
+      - name: Upload assets to draft release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          $assets = Get-ChildItem -Path release -File | Where-Object {
+            $_.Extension -in @(".exe", ".blockmap") -or $_.Name -eq "latest.yml"
+          } | Select-Object -ExpandProperty FullName
+
+          if (-not $assets) {
+            throw "No release assets were found to upload."
+          }
+
+          gh release upload $env:RELEASE_TAG $assets --clobber
+
       - name: Publish GitHub Release
-        uses: softprops/action-gh-release@v3.0.3
-        with:
-          tag_name: ${{ steps.version.outputs.tag }}
-          name: Chutes E2EE Chat ${{ steps.version.outputs.tag }}
-          generate_release_notes: true
-          fail_on_unmatched_files: true
-          files: |
-            release/*.exe
-            release/*.blockmap
-            release/latest.yml
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
+          RELEASE_NAME: Chutes E2EE Chat ${{ steps.version.outputs.tag }}
+        run: |
+          gh release edit $env:RELEASE_TAG --draft=false --title $env:RELEASE_NAME
