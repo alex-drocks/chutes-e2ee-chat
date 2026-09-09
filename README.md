@@ -96,20 +96,26 @@ Outputs are written to `release/`:
 
 Release automation lives in `.github/workflows/release.yml`.
 
-Tag-based release:
+Every push to `main`, including a merged pull request, automatically builds and publishes a new Windows release. The workflow chooses the next patch version from the existing Git tags (for example, `v0.2.1` becomes `v0.2.2`), runs the audit and CI tests, and builds the installer and portable executable. It then attaches the executables, blockmap, and `latest.yml` to a **draft** GitHub Release and publishes it only after the uploads succeed. Release runs are serialized to prevent concurrent runs from selecting the same version.
+
+**Do not click “Publish release” before the workflow finishes.** This repository uses immutable releases: GitHub locks their assets at publication. The workflow publishes the release for you. Deleting a published immutable release does not make its version reusable. See [GitHub's immutable release documentation](https://docs.github.com/en/code-security/concepts/supply-chain-security/immutable-releases).
+
+To choose a minor, major, or exact version manually:
+
+1. Open [Actions → Release](https://github.com/alex-drocks/chutes-e2ee-chat/actions/workflows/release.yml).
+2. Click **Run workflow** and select `main`.
+3. Choose `patch`, `minor`, or `major`, or enter an exact **unpublished** version.
+
+Alternatively, push a new version tag to build and publish that commit:
 
 ```bash
-git tag v0.1.1
-git push origin v0.1.1
+git tag v0.3.0
+git push origin v0.3.0
 ```
 
-Manual release:
+If publication fails after the build, the run's **Artifacts** section still contains a `windows-release-vX.Y.Z` download. An unpublished draft can be retried with its exact version. If the release was already published, use a new version instead.
 
-1. Open the `Release` workflow in GitHub Actions.
-2. Click `Run workflow`.
-3. Choose `patch`, `minor`, or `major`, or enter an exact version.
-
-The release workflow runs the audit and CI test subset, creates the next `vX.Y.Z` tag for manual releases, builds the Windows installer and portable executable with that version, then uploads the generated `.exe` files to a GitHub Release. The Windows executables are currently unsigned, so Windows SmartScreen may warn until a signing certificate is added.
+The Windows executables are currently unsigned, so Windows SmartScreen may warn until a signing certificate is added.
 
 ## Tests
 
