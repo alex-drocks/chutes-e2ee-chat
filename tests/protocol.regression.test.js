@@ -59,6 +59,20 @@ function seedTransportModel(transport, overrides = {}) {
   transport._discovery._modelMapLoadedAt = Date.now();
   return meta;
 }
+
+async function encryptStreamFrames(frames) {
+  const { pk, sk } = await generateKeyPair();
+  const { ct, ss } = await encapsulate(pk);
+  const key = deriveKey(ss, ct, INFO_STREAM);
+  const events = [{ e2e_init: ct.toString('base64') }];
+  for (const frame of frames) {
+    const nonce = randomBytes(CHACHA_NONCE_SIZE);
+    const { ciphertext, tag } = chachaEncrypt(key, nonce, Buffer.from(frame));
+    events.push({ e2e: Buffer.concat([nonce, ciphertext, tag]).toString('base64') });
+  }
+  return { responseSk: sk, wire: events.map(event => `data: ${JSON.stringify(event)}\n\n`).join('') };
+}
+
 describe('Protocol Invariants (no network)', () => {
 
   // ---------------------------------------------------------------------------
@@ -285,6 +299,75 @@ describe('Protocol Invariants (no network)', () => {
       ]),
       /stream stalled/,
     );
+  });
+
+  for (const encrypted of [false, true]) {
+    it(`should finish on an ${encrypted ? 'encrypted' : 'outer'} DONE marker without waiting for HTTP EOF`, async () => {
+      const content = 'data: {"choices":[{"delta":{"content":"Finished."}}]}';
+      const { responseSk, wire } = await encryptStreamFrames(
+        encrypted ? [content, 'data: [DONE]'] : [content],
+      );
+      let cancelled = false;
+      let closeCount = 0;
+      const rawStream = new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode(
+            wire + (encrypted ? '' : 'data: [DONE]\n\n') +
+            'data: {"e2e_error":"must ignore events after DONE"}\n\n',
+          ));
+          // The server deliberately keeps the connection open after completion.
+        },
+        cancel() { cancelled = true; },
+      });
+      const transport = new ChutesE2EETransport({ apiKey: '' });
+      const stream = transport._decorateStream(rawStream, responseSk, {
+        idleTimeoutMs: 500,
+        onClose() { closeCount += 1; },
+      });
+
+      const output = await new Response(stream).text();
+
+      assert.equal(output, `${content}\n\ndata: [DONE]\n\n`);
+      assert.equal(cancelled, true, 'terminal marker must release the upstream connection');
+      assert.equal(closeCount, 1);
+    });
+  }
+
+  it('should preserve a terminal marker without a trailing newline at HTTP EOF', async () => {
+    const transport = new ChutesE2EETransport({ apiKey: '' });
+    const stream = transport._decorateStream(new Response('data: [DONE]').body, Buffer.alloc(0));
+
+    assert.equal(await new Response(stream).text(), 'data: [DONE]\n\n');
+  });
+
+  it('should forward only usage from clear metadata while preserving encrypted content', async () => {
+    const content = 'data: {"choices":[{"delta":{"content":"Authenticated answer."}}]}';
+    const { responseSk, wire } = await encryptStreamFrames([content]);
+    const usage = { prompt_tokens: 10, completion_tokens: 5 };
+    const clearEvent = {
+      usage,
+      choices: [{ delta: {
+        content: 'Unauthenticated answer.',
+        tool_calls: [{ id: 'injected', type: 'function', function: { name: 'memory', arguments: '{}' } }],
+      } }],
+    };
+    const transport = new ChutesE2EETransport({ apiKey: '' });
+    // Clear metadata is not authenticated, even before the stream key arrives.
+    const stream = transport._decorateStream(
+      new Response(`data: ${JSON.stringify(clearEvent)}\n\n${wire}`).body, responseSk,
+    );
+
+    assert.equal(await new Response(stream).text(), `data: ${JSON.stringify({ usage })}\n\n${content}\n\n`);
+  });
+
+  it('should surface E2EE errors even when the event also carries usage', async () => {
+    const transport = new ChutesE2EETransport({ apiKey: '' });
+    const stream = transport._decorateStream(
+      new Response('data: {"usage":{},"e2e_error":{"message":"Inference failed"}}\n\n').body,
+      Buffer.alloc(0),
+    );
+
+    await assert.rejects(new Response(stream).text(), /Inference failed/);
   });
 
   it('should reject non-confidential model metadata before invoking E2EE', async () => {

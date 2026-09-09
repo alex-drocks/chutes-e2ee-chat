@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useChat } from '@ai-sdk/react';
-import { lastAssistantMessageIsCompleteWithToolCalls, type FileUIPart } from 'ai';
+import { lastAssistantMessageIsCompleteWithToolCalls, type ChatAddToolOutputFunction, type FileUIPart } from 'ai';
 import {
   AlertTriangle,
   Bot,
@@ -61,6 +61,7 @@ import { Tool, ToolContent, ToolHeader } from '@/components/ai-elements/tool';
 import { MemoryRecallFencing } from '@/components/MemoryRecallFencing';
 import { LiveStatusCard, StatusTimeline } from '@/components/StatusTimeline';
 import { MemoryStore } from '@/lib/memoryStore';
+import { ToolResultScope } from '@/lib/ai/toolResultScope';
 import {
   ChutesChatTransport,
   type ChutesChatConfig,
@@ -134,7 +135,7 @@ const EMPTY_API_KEY_STATUS: ApiKeyStatus = {
 const WELCOME_MESSAGE = {
   role: 'assistant',
   content:
-    'Welcome to Chutes E2EE Chat. Your messages are encrypted end-to-end using ML-KEM-768 + ChaCha20-Poly1305. Only the TEE GPU instance can decrypt your prompts.\n\nI learn from every conversation. Click the brain icon to see what I remember. I also handle hiccups automatically so we never lose momentum.',
+    'Welcome to Chutes E2EE Chat. Your messages are encrypted end-to-end.\n\nUse the brain icon to view and manage saved memories.',
 };
 
 function getErrorMessage(err: unknown, fallback: string) {
@@ -244,7 +245,8 @@ export default function ChatPage() {
   const clipboardImagePasteInFlightRef = useRef(false);
   const pasteEventHandledRef = useRef(false);
   const memoryStoreRef = useRef<MemoryStore>(new MemoryStore());
-  const addToolOutputRef = useRef<any>(null);
+  const addToolOutputRef = useRef<ChatAddToolOutputFunction<ChutesUIMessage> | null>(null);
+  const toolResultScopeRef = useRef(new ToolResultScope());
   const chatConfigRef = useRef<ChutesChatConfig>({
     model: '',
     toolsEnabled: true,
@@ -283,9 +285,14 @@ export default function ChatPage() {
 
   const chat = useChat<ChutesUIMessage>({
     transport: chatTransport,
-    sendAutomaticallyWhen: lastAssistantMessageIsCompleteWithToolCalls,
+    sendAutomaticallyWhen: (options) =>
+      toolResultScopeRef.current.active && lastAssistantMessageIsCompleteWithToolCalls(options),
     async onToolCall({ toolCall }) {
-      if (toolCall.dynamic) return;
+      if (toolCall.dynamic || !toolResultScopeRef.current.active) return;
+      // Capture this run before awaiting a tool. A later run must not accept its result.
+      const submitToolOutput = toolResultScopeRef.current.bind(
+        (output) => addToolOutputRef.current?.(output),
+      );
 
       // ----- Memory tool -----
       if ((toolCall.toolName as string) === 'memory') {
@@ -311,7 +318,7 @@ export default function ChatPage() {
 
         if (result.success) refreshMemoryUi();
 
-        addToolOutputRef.current?.({
+        submitToolOutput({
           tool: 'memory',
           toolCallId: toolCall.toolCallId,
           output: {
@@ -345,7 +352,7 @@ export default function ChatPage() {
       const query = typeof input?.query === 'string' ? input.query.trim() : '';
       const continuationConfig = getToolResultContinuationConfig();
       if (!query) {
-        addToolOutputRef.current?.({
+        submitToolOutput({
           tool: 'web_search',
           toolCallId: toolCall.toolCallId,
           state: 'output-error',
@@ -358,16 +365,17 @@ export default function ChatPage() {
         return;
       }
 
-      let result: Awaited<ReturnType<typeof window.chutes.webSearch>>;
+      let result: Awaited<ReturnType<typeof window.chutes.webSearch>> | undefined;
       try {
-        result = await window.chutes.webSearch(query, deepSearchEnabled, {
+        result = await toolResultScopeRef.current.waitFor(window.chutes.webSearch(query, deepSearchEnabled, {
           queries: Array.isArray(input?.queries) ? input.queries : undefined,
           recency: input?.recency,
-        });
+        }));
       } catch (err: unknown) {
         result = { ok: false, error: getErrorMessage(err, 'Web search failed.') };
       }
-      addToolOutputRef.current?.({
+      if (!result) return;
+      submitToolOutput({
         tool: 'web_search',
         toolCallId: toolCall.toolCallId,
         ...(result.ok
@@ -405,6 +413,11 @@ export default function ChatPage() {
   useEffect(() => {
     addToolOutputRef.current = addToolOutput;
   }, [addToolOutput]);
+
+  useEffect(() => {
+    const scope = toolResultScopeRef.current;
+    return () => scope.cancel();
+  }, []);
 
   useEffect(() => {
     const loading = aiStatus === 'submitted' || aiStatus === 'streaming';
@@ -769,6 +782,7 @@ export default function ChatPage() {
 
     try {
       const config = getCurrentChatConfig();
+      toolResultScopeRef.current.begin();
       await sendAiMessage(
         {
           parts: [
@@ -992,6 +1006,7 @@ export default function ChatPage() {
   }, [addClipboardImages, addFiles]);
 
   const abort = useCallback(() => {
+    toolResultScopeRef.current.cancel();
     stopAiMessage();
     setIsLoading(false);
     setStreamStage('idle');
@@ -1011,12 +1026,14 @@ export default function ChatPage() {
     if (retryCountRef.current > MAX_RETRIES) {
       return;
     }
+    toolResultScopeRef.current.begin();
     regenerateAiMessage({ body: getCurrentChatConfig() });
   }, [getCurrentChatConfig, regenerateAiMessage]);
 
   const regenerateMessage = useCallback(
     (messageId?: string) => {
       retryCountRef.current = 0;
+      toolResultScopeRef.current.begin();
       regenerateAiMessage({
         messageId,
         body: getCurrentChatConfig(),
@@ -1026,9 +1043,8 @@ export default function ChatPage() {
   );
 
   const startNewConversation = useCallback(() => {
-    if (isLoading) {
-      stopAiMessage();
-    }
+    toolResultScopeRef.current.cancel();
+    stopAiMessage();
     clearAiError();
     setAiMessages([]);
     setInput('');
@@ -1038,7 +1054,7 @@ export default function ChatPage() {
     setStreamStage('idle');
     retryCountRef.current = 0;
     window.setTimeout(() => inputRef.current?.focus(), 0);
-  }, [clearAiError, isLoading, setAiMessages, stopAiMessage]);
+  }, [clearAiError, setAiMessages, stopAiMessage]);
 
   const saveKey = async () => {
     if (!apiKey.trim()) return;

@@ -4,7 +4,7 @@ Thanks for taking the time to improve Chutes E2EE Chat.
 
 ## Development Setup
 
-1. Install Bun 1.3.13 or newer.
+1. Install Bun 1.4.2 or newer.
 2. Run `bun install` from the repository root.
 3. Run `bun run dev` to start the Next.js renderer and Electron app.
 

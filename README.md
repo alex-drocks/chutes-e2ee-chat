@@ -26,8 +26,8 @@ This project is not a substitute for a formal security audit. Review [SECURITY.m
 ## Requirements
 
 - Windows, macOS, or Linux for development.
-- Bun 1.3.13 or newer.
-- Node.js 22 or newer for tooling compatibility.
+- Bun 1.4.2 or newer.
+- Node.js 22.12 or newer for tooling compatibility.
 - A Chutes API key for real chat requests.
 
 ## Setup
@@ -132,6 +132,7 @@ RUN_LIVE_TESTS=1 CHUTES_API_KEY=cpk_xxx bun run test:live
 ```
 
 Live tests call the Chutes API and may consume account quota.
+Disabled live tests are reported as skipped. When explicitly enabled, they fail if the API key is missing, authentication fails, or no usable E2EE model is available.
 
 ## Dependency Audit
 
@@ -139,7 +140,7 @@ Live tests call the Chutes API and may consume account quota.
 bun audit
 ```
 
-This repository uses a small `overrides` block in `package.json` to keep vulnerable transitive packages patched while preserving the Electron Builder version that works with Bun's module layout.
+This repository uses a small `overrides` block in `package.json` to keep transitive packages patched. Electron Builder and its Squirrel helper are pinned to the same tested release.
 
 ## Project Structure
 

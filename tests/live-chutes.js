@@ -21,7 +21,6 @@ const LIVE_DIAGNOSTICS = process.env.LIVE_DIAGNOSTICS === '1';
 
 const SKIP_MSG = 'Skipped live Chutes tests - set CHUTES_API_KEY and RUN_LIVE_TESTS=1.';
 
-let skipNoticeShown = false;
 let liveContextPromise;
 
 class LiveModelUnavailableError extends Error {
@@ -32,29 +31,14 @@ class LiveModelUnavailableError extends Error {
 }
 
 export function liveTest(name, fn) {
-  test(name, { timeout: LIVE_TEST_TIMEOUT_MS }, async (t) => {
-    if (!LIVE_ENABLED) {
-      if (!skipNoticeShown) {
-        console.log(SKIP_MSG);
-        skipNoticeShown = true;
-      }
-      return;
-    }
+  test(name, {
+    timeout: LIVE_TEST_TIMEOUT_MS,
+    skip: LIVE_ENABLED ? false : SKIP_MSG,
+  }, async (t) => {
     if (!API_KEY) {
       throw new Error('CHUTES_API_KEY is required when RUN_LIVE_TESTS=1.');
     }
-    try {
-      await fn(t);
-    } catch (err) {
-      if (err instanceof LiveModelUnavailableError) {
-        if (!skipNoticeShown) {
-          console.log(`  ${err.message}`);
-          skipNoticeShown = true;
-        }
-        return;
-      }
-      throw err;
-    }
+    await fn(t);
   });
 }
 

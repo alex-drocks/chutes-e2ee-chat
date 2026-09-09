@@ -468,7 +468,12 @@ function toChutesMessages(messages: ChutesUIMessage[], config: ChutesChatConfig)
 
     if (message.role === 'assistant') {
       const text = collectText(message.parts);
-      const toolParts = collectToolParts(message.parts);
+      // Stopping a tool leaves its UI input in history. Only serialize calls
+      // with results, so the next user turn never contains an orphan tool call.
+      const toolParts = collectToolParts(message.parts).filter((part) =>
+        part.state === 'output-available' || part.state === 'output-error' || part.state === 'output-denied',
+      );
+      if (!text && toolParts.length === 0) continue;
       apiMessages.push({
         role: 'assistant',
         content: text || (toolParts.length > 0 ? null : ''),
@@ -487,18 +492,16 @@ function toChutesMessages(messages: ChutesUIMessage[], config: ChutesChatConfig)
       });
 
       for (const part of toolParts) {
-        if (part.state === 'output-available' || part.state === 'output-error' || part.state === 'output-denied') {
-          apiMessages.push({
-            role: 'tool',
-            tool_call_id: part.toolCallId,
-            name: part.toolName,
-            content: JSON.stringify(
-              part.state === 'output-available'
-                ? part.output
-                : { ok: false, error: part.errorText || 'Tool output denied.' },
-            ),
-          });
-        }
+        apiMessages.push({
+          role: 'tool',
+          tool_call_id: part.toolCallId,
+          name: part.toolName,
+          content: JSON.stringify(
+            part.state === 'output-available'
+              ? part.output
+              : { ok: false, error: part.errorText || 'Tool output denied.' },
+          ),
+        });
       }
     }
   }
