@@ -135,7 +135,7 @@ const EMPTY_API_KEY_STATUS: ApiKeyStatus = {
 const WELCOME_MESSAGE = {
   role: 'assistant',
   content:
-    'Welcome to Chutes E2EE Chat. Your messages are encrypted end-to-end using ML-KEM-768 + ChaCha20-Poly1305. Only the TEE GPU instance can decrypt your prompts.\n\nI learn from every conversation. Click the brain icon to see what I remember. I also handle hiccups automatically so we never lose momentum.',
+    'Welcome to Chutes E2EE Chat. Your messages are encrypted end-to-end.\n\nUse the brain icon to view and manage saved memories.',
 };
 
 function getErrorMessage(err: unknown, fallback: string) {
