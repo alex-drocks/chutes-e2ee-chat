@@ -199,7 +199,7 @@ jobs:
           Get-ChildItem -Path release -File | Select-Object Name, Length | Format-Table -AutoSize
 
       - name: Upload workflow artifact
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: windows-release-${{ steps.version.outputs.tag }}
           if-no-files-found: error
